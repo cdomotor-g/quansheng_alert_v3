@@ -151,7 +151,7 @@ static uint16_t dbgKeyCount;     // key transitions seen from KEYBOARD_Poll
 static int16_t  dbgLastKey = -1; // last key code seen
 static uint16_t dbgIrqCount;     // times REG_0C reported an interrupt pending
 static uint16_t dbgIrqBits;      // last REG_02 word
-static uint16_t dbgLoop;         // free-running: increments every loop pass
+static uint32_t dbgLoop;         // free-running: increments every loop pass
 static int16_t  dbgRawKey;       // what KEYBOARD_Poll returned THIS pass
 static uint8_t  dbgRawPtt;       // PTT GPIO read directly, this pass
 static bool     capturing;
@@ -641,7 +641,7 @@ static void DrawMain(void)
 		// L is the liveness proof: it increments every pass of the main loop, so
 		// a frozen L means the app is stuck, not merely idle. k is the raw
 		// KEYBOARD_Poll() value this instant, P the PTT pin read directly.
-		sprintf(s, "L%u k%d P%u I%u", dbgLoop, (int)dbgRawKey, dbgRawPtt, dbgIrqCount);
+		sprintf(s, "L%u k%d P%u I%u", (unsigned)dbgLoop, (int)dbgRawKey, dbgRawPtt, dbgIrqCount);
 		UI_PrintStringSmallNormal(s, 0, 127, 6);
 		UI_PrintStringSmallNormal("MENU=SET *=VOICE 1=RAW", 0, 127, 6);
 	} else {
@@ -1011,8 +1011,18 @@ void APP_RunAlert(void)
 				rssiDbm = BK4819_GetRSSI_dBm();
 				DrawStatus();
 			}
-			if ((tick % 50) == 0)
-				redraw = true;   // ~500 ms heartbeat: a frozen screen is now visible as such
+			if ((tick % 50) == 0) {
+				// The ST7565 loses its register state when the BK4819 changes RF
+				// state; this fork re-sends the init list after TX and after
+				// sleep-wake for exactly that reason. This app reprograms the
+				// BK4819 into FSK/TONE2 and never re-armed the controller, so the
+				// glass went dead while the CPU kept running.
+				ST7565_FixInterfGlitch();
+				// Liveness that does not depend on the display: if this blinks with
+				// a dark screen, the loop is fine and only the LCD is lost.
+				GPIO_TogglePin(GPIO_PIN_FLASHLIGHT);
+				redraw = true;
+			}
 		}
 
 		if (redraw)
@@ -1032,6 +1042,7 @@ void APP_RunAlert(void)
 	ALERT_StoreConfig();
 	SETTINGS_SaveSettings();
 	RADIO_SetupRegisters(true);
+	ST7565_FixInterfGlitch();   // leave the controller in a state the main UI can draw on
 	gRequestDisplayScreen = DISPLAY_MAIN;
 	gUpdateStatus  = true;
 	gUpdateDisplay = true;
