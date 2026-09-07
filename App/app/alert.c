@@ -140,6 +140,7 @@ static struct {
 } stats;
 
 // capture buffer shared by both inputs
+#define ALERT_DEFAULT_FREQ 15150000u   // 151.500 MHz, in units of 10 Hz
 static uint8_t  capBuf[256];
 static uint16_t capLen;          // bytes (modem) or bits (ADC)
 
@@ -641,7 +642,7 @@ static void DrawMain(void)
 		// L is the liveness proof: it increments every pass of the main loop, so
 		// a frozen L means the app is stuck, not merely idle. k is the raw
 		// KEYBOARD_Poll() value this instant, P the PTT pin read directly.
-		sprintf(s, "L%u k%d P%u I%u", (unsigned)dbgLoop, (int)dbgRawKey, dbgRawPtt, dbgIrqCount);
+		sprintf(s, "I%u S%u F%u G%u", dbgIrqCount, stats.syncs, stats.frames, stats.gated);
 		UI_PrintStringSmallNormal(s, 0, 0, 6);   // End=0: left-aligned, no centring arithmetic
 	} else {
 		const History_t *h = &history[0];
@@ -665,7 +666,7 @@ static void DrawMain(void)
 		// lines 3..6: history
 		for (uint8_t i = 0; i < 4 && i < historyCount; i++) {
 			const History_t *e = &history[i];
-			const char *n2; uint8_t k2; char v[8];
+			const char *n2; uint8_t k2; char v[16];
 			ALERT_LookupStation(e->id, &n2, &k2);
 			FormatValue(v, e->value, e->kind);
 			sprintf(s, "%4u %-9.9s %6s", e->id, n2[0] ? n2 : "?", v);
@@ -679,13 +680,14 @@ static void DrawMain(void)
 enum {
 	SET_INPUT, SET_POLARITY, SET_VOICE, SET_GATE, SET_UNKNOWN, SET_CONFIRM, SET_MONITOR,
 	SET_MODE, SET_BAUD, SET_SYNC, SET_SYNC4, SET_INVERT, SET_BITREV, SET_RXGAIN, SET_PKTLEN,
+	SET_FREQ,
 	SET_SQL, SET_N
 };
 
 static const char *const setNames[SET_N] = {
 	"INPUT", "POLARITY", "VOICE", "SQ GATE", "UNKNOWN", "CONFIRM", "MONITOR",
 	"MDM MODE", "BAUD", "SYNC", "SYNC LEN", "INVERT", "BIT REV", "RX GAIN", "CAPTURE",
-	"SQL LEVEL"
+	"SQL LEVEL", "FREQ MHz"
 };
 
 static void SetValueString(uint8_t idx, char *s)
@@ -711,6 +713,11 @@ static void SetValueString(uint8_t idx, char *s)
 		case SET_RXGAIN:   sprintf(s, "%u", cfg.rxgain); break;
 		case SET_PKTLEN:   sprintf(s, "%u B", cfg.pktlen); break;
 		case SET_SQL:      sprintf(s, "%u.%u", gEeprom.SQUELCH_LEVEL, gEeprom.SQUELCH_TENTHS); break;
+		case SET_FREQ: {
+			const uint32_t f = gRxVfo->pRX->Frequency;
+			sprintf(s, "%u.%03u", (unsigned)(f / 100000u), (unsigned)((f % 100000u) / 100u));
+			break;
+		}
 		default: s[0] = 0; break;
 	}
 }
@@ -782,6 +789,19 @@ static void ChangeSetting(uint8_t idx, int dir)
 			if (v < 16) v = 16;
 			if (v > 240) v = 240;
 			cfg.pktlen = (uint8_t)v;
+			rearm = true;
+			break;
+		}
+		case SET_FREQ: {
+			// Frequency is in units of 10 Hz. Step 12.5 kHz, the ALERT channel
+			// spacing, and keep it inside the 2 m / VHF range the receiver can
+			// actually tune.
+			int32_t f = (int32_t)gRxVfo->pRX->Frequency + dir * 1250;
+			if (f < 13000000) f = 13000000;      // 130 MHz
+			if (f > 17400000) f = 17400000;      // 174 MHz
+			gRxVfo->pRX->Frequency = (uint32_t)f;
+			gRequestSaveVFO = true;              // so it survives leaving the app
+			RADIO_SetupRegisters(true);
 			rearm = true;
 			break;
 		}
@@ -913,6 +933,14 @@ void APP_RunAlert(void)
 	historyCount = 0;
 
 	// normal RX on the current VFO, then squelch as configured, audio muted
+	// The app listens on whatever the VFO is tuned to. If the radio is parked
+	// somewhere it could never hear an ALERT burst - 400 MHz was what turned up
+	// on hardware - snap to the network frequency instead of silently listening
+	// to nothing. Anything already in band is left alone.
+	if (gRxVfo->pRX->Frequency < 13000000u || gRxVfo->pRX->Frequency > 17400000u) {
+		gRxVfo->pRX->Frequency = ALERT_DEFAULT_FREQ;
+		gRequestSaveVFO = true;
+	}
 	RADIO_SetupRegisters(true);
 	FUNCTION_Select(FUNCTION_FOREGROUND);
 	AUDIO_AudioPathOff();
@@ -1017,9 +1045,6 @@ void APP_RunAlert(void)
 				// BK4819 into FSK/TONE2 and never re-armed the controller, so the
 				// glass went dead while the CPU kept running.
 				ST7565_FixInterfGlitch();
-				// Liveness that does not depend on the display: if this blinks with
-				// a dark screen, the loop is fine and only the LCD is lost.
-				GPIO_TogglePin(GPIO_PIN_FLASHLIGHT);
 				redraw = true;
 			}
 		}
