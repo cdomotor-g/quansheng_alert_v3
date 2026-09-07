@@ -629,7 +629,7 @@ static void DrawMain(void)
 		sprintf(s, "%u.%05u MHz", (unsigned)(f / 100000u), (unsigned)(f % 100000u));
 		UI_PrintStringSmallNormal(s, 0, 127, 0);
 		UI_PrintStringSmallNormal("WAITING FOR ALERT", 0, 127, 2);
-		sprintf(s, "%u SITES %s", ALERT_StationCount(), ALERT_StationSource());
+		sprintf(s, "%u SITES", ALERT_StationCount());
 		UI_PrintStringSmallNormal(s, 0, 127, 3);
 		sprintf(s, "SQL %u.%u  %s", gEeprom.SQUELCH_LEVEL, gEeprom.SQUELCH_TENTHS,
 		        cfg.voice ? "VOICE" : "QUIET");
@@ -642,8 +642,7 @@ static void DrawMain(void)
 		// a frozen L means the app is stuck, not merely idle. k is the raw
 		// KEYBOARD_Poll() value this instant, P the PTT pin read directly.
 		sprintf(s, "L%u k%d P%u I%u", (unsigned)dbgLoop, (int)dbgRawKey, dbgRawPtt, dbgIrqCount);
-		UI_PrintStringSmallNormal(s, 0, 127, 6);
-		UI_PrintStringSmallNormal("MENU=SET *=VOICE 1=RAW", 0, 127, 6);
+		UI_PrintStringSmallNormal(s, 0, 0, 6);   // End=0: left-aligned, no centring arithmetic
 	} else {
 		const History_t *h = &history[0];
 		const char *name; uint8_t kind;
