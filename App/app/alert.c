@@ -68,7 +68,10 @@ static struct {
 	bool     confirm;      // require the same reading twice in one burst
 } cfg;
 
-#define CFG_MAGIC 0xA0u
+// Bumped from 0xA0 when the modem registers below were corrected. Settings
+// stored before that point were swept against a configuration that could not
+// work, so put everyone back on the known-good baseline once.
+#define CFG_MAGIC 0xB0u
 
 void ALERT_LoadConfig(void)
 {
@@ -77,8 +80,12 @@ void ALERT_LoadConfig(void)
 		cfg.input = INPUT_MODEM; cfg.polarity = ALERT_POL_NEGATIVE;
 		cfg.voice = true;  cfg.gate = true;  cfg.show_unknown = true;
 		cfg.bitrev = false; cfg.monitor = false;
-		cfg.mode = MODE_FFSK_1200_1800; cfg.sync = SYNC_0000; cfg.invert = false; cfg.sync4 = false;
-		cfg.rxgain = 3; cfg.baud = 300; cfg.pktlen = 96; cfg.confirm = false;
+		// sync4: every working FSK path in this fork uses a 4-byte sync word.
+		// pktlen 32: FSK_RX_FINISHED only fires once the programmed length has
+		// arrived, so 96 bytes meant waiting 2.5 s at 300 baud for an interrupt
+		// that a short burst never produces at all.
+		cfg.mode = MODE_FFSK_1200_1800; cfg.sync = SYNC_0000; cfg.invert = false; cfg.sync4 = true;
+		cfg.rxgain = 3; cfg.baud = 300; cfg.pktlen = 32; cfg.confirm = false;
 		return;
 	}
 	cfg.input        = b[0] & 1u;
@@ -98,7 +105,7 @@ void ALERT_LoadConfig(void)
 	cfg.confirm      = b[4] & 1u;
 	if (cfg.polarity > ALERT_POL_ANY) cfg.polarity = ALERT_POL_NEGATIVE;
 	if (cfg.baud < 200 || cfg.baud > 1200) cfg.baud = 300;
-	if (cfg.pktlen < 16) cfg.pktlen = 96;
+	if (cfg.pktlen < 16) cfg.pktlen = 32;
 #ifndef ENABLE_ALERT_ADC
 	cfg.input = INPUT_MODEM;
 #endif
@@ -137,6 +144,7 @@ static struct {
 	uint16_t frames;     // valid frames decoded
 	uint16_t gated;      // captures dropped because the squelch was closed
 	uint16_t unknown;    // frames whose address is not in the table
+	uint16_t stuck;      // captures ended by the watchdog, not by the chip
 } stats;
 
 // capture buffer shared by both inputs
@@ -156,6 +164,7 @@ static uint32_t dbgLoop;         // free-running: increments every loop pass
 static int16_t  dbgRawKey;       // what KEYBOARD_Poll returned THIS pass
 static uint8_t  dbgRawPtt;       // PTT GPIO read directly, this pass
 static bool     capturing;
+static uint16_t capAge10ms;      // 10 ms ticks since the sync word, for the watchdog
 static bool     capGate;         // squelch was open at some point during the capture
 static int16_t  capRssi;
 
@@ -186,6 +195,17 @@ static uint16_t tone_reg(uint16_t hz)
 // from "keys arrive but exit is broken", and "no RF event" from "RF event but
 // no decode". Costs nothing when ENABLE_UART is off.
 
+// REG_59: <15> clr TX FIFO, <14> clr RX FIFO, <13> scramble, <12> RX enable,
+// <10> invert RX data, <7:4> preamble length, <3> 4-byte sync word.
+//
+// The preamble nibble used to be left at zero here. BK4819_ResetFSK and every
+// working FSK path in this fork write 0x0068 - preamble 6, 4-byte sync - so
+// keep the 6.
+static uint16_t FskBase(void)
+{
+	return (uint16_t)(((uint16_t)cfg.invert << 10) | (6u << 4) | ((uint16_t)cfg.sync4 << 3));
+}
+
 static void ModemStop(void)
 {
 	BK4819_WriteRegister(BK4819_REG_59, (1u << 14) | (1u << 15));   // clear FIFOs, RX/TX off
@@ -202,16 +222,23 @@ static void ModemArm(void)
 	BK4819_WriteRegister(BK4819_REG_70, (1u << 7) | (96u << 0));
 	BK4819_WriteRegister(BK4819_REG_72, tone_reg(cfg.baud));
 
-	// REG_58: <15:13> TX mode, <12:10> RX mode, <9:8> RX gain, <5:4> preamble
-	//         type, <3:1> RX bandwidth, <0> enable   (Beken register list)
-	switch (cfg.mode) {
-		default:
-		case MODE_FFSK_1200_1800: reg58 = (1u << 13) | (7u << 10) | (1u << 1); break;
-		case MODE_FFSK_1200_2400: reg58 = (3u << 13) | (4u << 10) | (4u << 1); break;
-		case MODE_SAME:           reg58 = (5u << 13) | (0u << 10) | (2u << 1); break;
-		case MODE_DIRECT:         reg58 = (0u << 13) | (0u << 10) | (0u << 1); break;
+	// REG_58: <15:13> TX mode, <12:10> RX mode, <9:8> RX gain, <3:1> RX
+	// bandwidth, <0> enable.
+	//
+	// These are no longer invented. Every FSK configuration that actually works
+	// in this fork - BK4819_SetupAircopy (0x00C1) and the roger-beep setup
+	// (0x37C3) - has bits <7:6> set, and all four values below keep them. The
+	// table that used to be here left them clear, which nothing else in the
+	// tree does, and the receiver synced about once a minute.
+	{
+		static const uint16_t modeReg58[MODE_N] = {
+			0x00C1,   // RX mode 0, narrow - the aircopy receive configuration
+			0x04C3,   // RX mode 1, 1.2K bandwidth
+			0x14C5,   // RX mode 5, NOAA SAME
+			0x00C3,   // RX mode 0, wider bandwidth
+		};
+		reg58 = modeReg58[cfg.mode < MODE_N ? cfg.mode : 0] | ((uint16_t)cfg.rxgain << 8);
 	}
-	reg58 |= ((uint16_t)cfg.rxgain << 8) | 1u;
 	BK4819_WriteRegister(BK4819_REG_58, reg58);
 
 	// sync word = the idle pattern the transmitter sends before the data, so
@@ -225,12 +252,14 @@ static void ModemArm(void)
 
 	BK4819_WriteRegister(BK4819_REG_5C, 0x5625);                       // CRC off
 	BK4819_WriteRegister(BK4819_REG_5D, (uint16_t)cfg.pktlen << 8);    // capture length
-	BK4819_WriteRegister(BK4819_REG_5E, (64u << 3) | (4u << 0));       // RX FIFO almost-full at 4 words
+	// REG_5E is deliberately not written. Nothing else in this fork touches it;
+	// both working receivers (aircopy and beam) take the reset value and read
+	// four words per almost-full interrupt, which is what we do now as well.
+	// The threshold that used to be written here was a guess at a bit layout no
+	// datasheet to hand confirms.
 
-	// REG_59: <15> clr TX FIFO, <14> clr RX FIFO, <13> scramble, <12> RX en,
-	//         <10> invert RX, <7:4> preamble length, <3> 4-byte sync
 	{
-		const uint16_t base = ((uint16_t)cfg.invert << 10) | ((uint16_t)cfg.sync4 << 3);
+		const uint16_t base = FskBase();
 		BK4819_WriteRegister(BK4819_REG_59, base | (1u << 14) | (1u << 15));
 		BK4819_WriteRegister(BK4819_REG_59, base);
 		BK4819_WriteRegister(BK4819_REG_59, base | (1u << 12));
@@ -255,6 +284,36 @@ static void ModemReadWords(unsigned words)
 }
 
 static void ProcessCapture(const uint8_t *buf, uint32_t nbits, bool gated, int16_t rssi);
+static void DbgSend(const char *s);
+
+static void ModemReArm(void)
+{
+	const uint16_t base = FskBase();
+	BK4819_WriteRegister(BK4819_REG_59, base | (1u << 14));
+	BK4819_WriteRegister(BK4819_REG_59, base | (1u << 12));
+	capLen = 0;
+}
+
+// End a capture and hand it to the decoder. Called from the RX_FINISHED
+// interrupt and from the watchdog in the main loop, because a burst shorter
+// than the programmed packet length never raises RX_FINISHED at all: the
+// engine simply waits for the rest of a packet that is not coming. That left
+// capturing stuck true, so every later burst was ignored - syncs counted up
+// and nothing ever decoded, which is precisely what the radio reported.
+static void FinishCapture(void)
+{
+	capturing = false;
+	if (cfg.bitrev) {
+		for (uint16_t i = 0; i < capLen; i++) {
+			uint8_t b = capBuf[i];
+			b = (uint8_t)(((b & 0x55u) << 1) | ((b & 0xAAu) >> 1));
+			b = (uint8_t)(((b & 0x33u) << 2) | ((b & 0xCCu) >> 2));
+			capBuf[i] = (uint8_t)((b << 4) | (b >> 4));
+		}
+	}
+	ProcessCapture(capBuf, (uint32_t)capLen * 8u, capGate, capRssi);
+	ModemReArm();   // the next burst may follow within a few bits
+}
 
 static void ModemPoll(void)
 {
@@ -275,10 +334,11 @@ static void ModemPoll(void)
 		dbgIrqBits = irq;
 
 		if (irq & BK4819_REG_02_FSK_RX_SYNC) {
-			capturing = true;
-			capLen    = 0;
-			capGate   = sqOpen;
-			capRssi   = rssiDbm;
+			capturing  = true;
+			capLen     = 0;
+			capGate    = sqOpen;
+			capRssi    = rssiDbm;
+			capAge10ms = 0;
 			stats.syncs++;
 			redraw = true;
 		}
@@ -289,24 +349,10 @@ static void ModemPoll(void)
 			if (capturing) {
 				if (capLen < cfg.pktlen)
 					ModemReadWords((cfg.pktlen - capLen + 1u) / 2u);
-				capturing = false;
-				if (cfg.bitrev) {
-					for (uint16_t i = 0; i < capLen; i++) {
-						uint8_t b = capBuf[i];
-						b = (uint8_t)(((b & 0x55u) << 1) | ((b & 0xAAu) >> 1));
-						b = (uint8_t)(((b & 0x33u) << 2) | ((b & 0xCCu) >> 2));
-						capBuf[i] = (uint8_t)((b << 4) | (b >> 4));
-					}
-				}
-				ProcessCapture(capBuf, (uint32_t)capLen * 8u, capGate, capRssi);
+				FinishCapture();
+			} else {
+				ModemReArm();
 			}
-			// re-arm immediately: the next burst may follow within a few bits
-			{
-				const uint16_t base = ((uint16_t)cfg.invert << 10) | ((uint16_t)cfg.sync4 << 3);
-				BK4819_WriteRegister(BK4819_REG_59, base | (1u << 14));
-				BK4819_WriteRegister(BK4819_REG_59, base | (1u << 12));
-			}
-			capLen = 0;
 		}
 	}
 }
@@ -524,6 +570,20 @@ static void ProcessCapture(const uint8_t *buf, uint32_t nbits, bool gated, int16
 	lastCapLen = (uint16_t)nbits;
 	memcpy(lastCap, buf, sizeof(lastCap));
 
+	{	// every capture, raw, before the gate and before the decoder: whatever
+		// is wrong with the demodulation is visible here and nowhere else.
+		static char line[112];
+		unsigned n = (unsigned)((nbits + 7u) / 8u);
+		if (n > 40) n = 40;
+		int k = sprintf(line, "A %u %u %d ", (unsigned)nbits, gated ? 1u : 0u, rssi);
+		for (unsigned i = 0; i < n; i++)
+			k += sprintf(line + k, "%02X", buf[i]);
+		line[k++] = '\r';
+		line[k++] = '\n';
+		line[k]   = 0;
+		DbgSend(line);
+	}
+
 	if (cfg.gate && !gated) {
 		stats.gated++;
 		redraw = true;
@@ -582,6 +642,20 @@ static void ProcessCapture(const uint8_t *buf, uint32_t nbits, bool gated, int16
 
 // ---------------------------------------------------------------------------
 // display
+
+// Debug telemetry over USB. UART_ServiceCommands() runs on every pass of the
+// main loop below, and cdc_acm_data_send_with_dtr() is a no-op unless a host
+// has the port open with DTR asserted, so this costs nothing when nobody is
+// listening. It is the only way to see the bytes the demodulator actually
+// produced: the screen has room for eight of them.
+static void DbgSend(const char *s)
+{
+#ifdef ENABLE_USB
+	VCP_SendStr(s);
+#else
+	(void)s;
+#endif
+}
 
 static void FormatValue(char *out, uint16_t value, uint8_t kind)
 {
@@ -642,7 +716,11 @@ static void DrawMain(void)
 		// L is the liveness proof: it increments every pass of the main loop, so
 		// a frozen L means the app is stuck, not merely idle. k is the raw
 		// KEYBOARD_Poll() value this instant, P the PTT pin read directly.
-		sprintf(s, "I%u S%u F%u G%u", dbgIrqCount, stats.syncs, stats.frames, stats.gated);
+		// S rises when the FSK engine finds the sync word, B is the size of the
+		// last capture in bits - B still 0 with S climbing means the engine syncs
+		// but no bytes ever leave the FIFO - F is decoded frames and G captures
+		// thrown away by the squelch gate.
+		sprintf(s, "S%u B%u F%u G%u", stats.syncs, lastCapLen, stats.frames, stats.gated);
 		UI_PrintStringSmallNormal(s, 0, 0, 6);   // End=0: left-aligned, no centring arithmetic
 	} else {
 		const History_t *h = &history[0];
@@ -687,7 +765,10 @@ enum {
 static const char *const setNames[SET_N] = {
 	"INPUT", "POLARITY", "VOICE", "SQ GATE", "UNKNOWN", "CONFIRM", "MONITOR",
 	"MDM MODE", "BAUD", "SYNC", "SYNC LEN", "INVERT", "BIT REV", "RX GAIN", "CAPTURE",
-	"SQL LEVEL", "FREQ MHz"
+	// SET_FREQ comes before SET_SQL in the enum above. These two were the wrong
+	// way round, so the row labelled FREQ stepped the squelch and the row
+	// labelled SQL LEVEL stepped the frequency.
+	"FREQ MHz", "SQL LEVEL"
 };
 
 static void SetValueString(uint8_t idx, char *s)
@@ -836,7 +917,7 @@ static void DrawRaw(void)
 	UI_PrintStringSmallNormal("RAW CAPTURE", 0, 127, 0);
 	sprintf(s, "SYNC %u  FRM %u", stats.syncs, stats.frames);
 	UI_PrintStringSmallNormal(s, 0, 0, 1);
-	sprintf(s, "GATED %u  UNKN %u", stats.gated, stats.unknown);
+	sprintf(s, "GATED %u UNK %u ST %u", stats.gated, stats.unknown, stats.stuck);
 	UI_PrintStringSmallNormal(s, 0, 0, 2);
 	sprintf(s, "LAST %u BITS", lastCapLen);
 	UI_PrintStringSmallNormal(s, 0, 0, 3);
@@ -921,9 +1002,9 @@ static void OnKey(KEY_Code_t key)
 
 void APP_RunAlert(void)
 {
-	KEY_Code_t lastKey = KEY_INVALID;
-	uint16_t   keyHeldMs = 0;
-	uint16_t   pttHeldMs = 0;
+	KEY_Code_t lastKey     = KEY_INVALID;
+	uint16_t   keyHeld10ms = 0;
+	uint16_t   pttHeld10ms = 0;
 
 	ALERT_LoadConfig();
 	running = true;
@@ -931,6 +1012,10 @@ void APP_RunAlert(void)
 	redraw  = true;
 	memset(&stats, 0, sizeof(stats));
 	historyCount = 0;
+	// These are statics, so without this they carry over from the last run.
+	dbgLoop = 0; dbgIrqCount = 0; dbgKeyCount = 0;
+	lastCapLen = 0; capturing = false; capLen = 0; capAge10ms = 0;
+	tick = 0;
 
 	// normal RX on the current VFO, then squelch as configured, audio muted
 	// The app listens on whatever the VFO is tuned to. If the radio is parked
@@ -974,36 +1059,8 @@ void APP_RunAlert(void)
 			dbgLastKey = (int16_t)key;
 			if (key != KEY_INVALID && key != KEY_PTT)
 				OnKey(key);
-			lastKey = key;
-		}
-
-		// Absolute backstop: leave after ~3 minutes no matter what. Every escape
-		// so far has depended on an input path that may itself be the fault, and
-		// being trapped in here means a power cycle every single test.
-		if (dbgLoop > 180000u)
-			running = false;
-
-		// Escape that does not depend on the key matrix at all: the PTT is a
-		// plain GPIO. If KEYBOARD_Poll() never reports anything in this context
-		// - which is what the first hardware test suggests - this is still a
-		// way out without a power cycle.
-		if (GPIO_IsPttPressed()) {
-			if (++pttHeldMs > 800)
-				running = false;
-		} else {
-			pttHeldMs = 0;
-		}
-
-		// Escape hatch: holding any key for ~3 s always leaves the app. Edge
-		// detection above fires once per press, so if a key were mis-mapped or
-		// an edge missed there would otherwise be no way out but a power cycle
-		// - which is exactly what was reported on first hardware test.
-		if (key != KEY_INVALID && key == lastKey) {
-			if (++keyHeldMs > 3000) {
-				running = false;
-			}
-		} else {
-			keyHeldMs = 0;
+			lastKey    = key;
+			keyHeld10ms = 0;   // a new key starts its own hold timer
 		}
 
 		// signal input
@@ -1034,6 +1091,35 @@ void APP_RunAlert(void)
 		if (gNextTimeslice) {
 			gNextTimeslice = false;
 			BACKLIGHT_Update();
+
+			// Hold-to-leave timers, in real 10 ms ticks. They used to count passes
+			// of this loop, which is not a clock: at roughly 200 us a pass the
+			// "800 ms" of PTT was about 160 ms and the "3 s" key hold about 600 ms,
+			// so an ordinary press dropped the user out of the app - the flaky
+			// buttons. The same arithmetic put the "3 minute" backstop at about a
+			// minute, which is what looked like the app crashing. The backstop is
+			// gone: a receiver is supposed to sit and listen.
+			if (dbgRawPtt) {
+				if (++pttHeld10ms > 50)     // 500 ms
+					running = false;
+			} else {
+				pttHeld10ms = 0;
+			}
+			if (dbgRawKey != (int16_t)KEY_INVALID) {
+				if (++keyHeld10ms > 250)    // 2.5 s
+					running = false;
+			} else {
+				keyHeld10ms = 0;
+			}
+
+			// A burst shorter than the programmed packet length never raises
+			// RX_FINISHED, so without this the first sync of the session latches
+			// capturing true and nothing is ever decoded again.
+			if (capturing && ++capAge10ms > 150) {   // 1.5 s
+				stats.stuck++;
+				FinishCapture();
+			}
+
 			if ((++tick % 10) == 0) {
 				rssiDbm = BK4819_GetRSSI_dBm();
 				DrawStatus();
@@ -1046,6 +1132,13 @@ void APP_RunAlert(void)
 				// glass went dead while the CPU kept running.
 				ST7565_FixInterfGlitch();
 				redraw = true;
+				{
+					char hb[80];
+					sprintf(hb, "D I%u S%u F%u G%u X%u B%u R%d Q%u\r\n",
+					        dbgIrqCount, stats.syncs, stats.frames, stats.gated,
+					        stats.stuck, lastCapLen, rssiDbm, sqOpen ? 1u : 0u);
+					DbgSend(hb);
+				}
 			}
 		}
 
