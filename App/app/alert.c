@@ -165,6 +165,21 @@ static int16_t  dbgRawKey;       // what KEYBOARD_Poll returned THIS pass
 static uint8_t  dbgRawPtt;       // PTT GPIO read directly, this pass
 static bool     capturing;
 static uint16_t capAge10ms;      // 10 ms ticks since the sync word, for the watchdog
+
+// Automatic configuration sweep. Sixteen sync-word/invert/sync-length
+// combinations across four modem modes is 64 arrangements, which is far too
+// many to try by hand on a radio that has to be reflashed to change anything.
+// With SWEEP on, the app walks all 64 and reports the sync count for each
+// over USB, so one long transmission answers "can this engine lock onto the
+// signal under any setting" instead of thirty-two flashes. Never persisted:
+// the settings in force when it started are put back when it stops.
+#define SWEEP_N       64u
+#define SWEEP_DWELL   150u        // 10 ms ticks, so 1.5 s per arrangement
+static bool     sweeping;
+static uint8_t  sweepIdx;
+static uint16_t sweepAge10ms;
+static uint16_t sweepSyncMark;
+static uint8_t  sweepSaved[4];   // mode, sync, invert, sync4
 static bool     capGate;         // squelch was open at some point during the capture
 static int16_t  capRssi;
 
@@ -218,6 +233,18 @@ static void ModemArm(void)
 {
 	uint16_t reg58;
 
+	// Start the way BK4819_PrepareFSKReceive() does. That is the only FSK
+	// receive setup in this fork known to work on this chip, and the piece
+	// missing here was the DSP restart: BK4819_ResetFSK() takes REG_30 to zero
+	// through BK4819_Idle(), and BK4819_RX_TurnOn() brings it back up. This
+	// used to write REG_58/59 into an already-running receiver, which produced
+	// no sync interrupt at all in 30 s of -16 dBm signal with the squelch
+	// opening on every burst.
+	BK4819_ResetFSK();
+	BK4819_WriteRegister(BK4819_REG_02, 0);
+	BK4819_WriteRegister(BK4819_REG_3F, 0);
+	BK4819_RX_TurnOn();
+
 	// TONE2 = FSK bit clock; enable it with a healthy gain
 	BK4819_WriteRegister(BK4819_REG_70, (1u << 7) | (96u << 0));
 	BK4819_WriteRegister(BK4819_REG_72, tone_reg(cfg.baud));
@@ -270,8 +297,13 @@ static void ModemArm(void)
 		BK4819_REG_3F_SQUELCH_FOUND | BK4819_REG_3F_SQUELCH_LOST);
 	BK4819_WriteRegister(BK4819_REG_02, 0);
 
-	capturing = false;
-	capLen    = 0;
+	// BK4819_RX_TurnOn re-enables the AF DAC, so put the audio path back where
+	// the settings say it should be rather than wherever the reset left it.
+	BK4819_SetAF(cfg.monitor ? BK4819_AF_FM : BK4819_AF_MUTE);
+
+	capturing  = false;
+	capLen     = 0;
+	capAge10ms = 0;
 }
 
 static void ModemReadWords(unsigned words)
@@ -709,6 +741,11 @@ static void DrawMain(void)
 		sprintf(s, "SQL %u.%u  %s", gEeprom.SQUELCH_LEVEL, gEeprom.SQUELCH_TENTHS,
 		        cfg.voice ? "VOICE" : "QUIET");
 		UI_PrintStringSmallNormal(s, 0, 127, 5);
+		if (sweeping) {
+			sprintf(s, "SWEEP %u/%u M%u S%u I%u L%u", sweepIdx + 1u, (unsigned)SWEEP_N,
+			        cfg.mode, cfg.sync, cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u);
+			UI_PrintStringSmallNormal(s, 0, 0, 4);
+		}
 
 		// Diagnostics on the last line. K rises if the key matrix reaches this
 		// app at all, I rises when the BK4819 raises an interrupt, and the two
@@ -759,7 +796,7 @@ enum {
 	SET_INPUT, SET_POLARITY, SET_VOICE, SET_GATE, SET_UNKNOWN, SET_CONFIRM, SET_MONITOR,
 	SET_MODE, SET_BAUD, SET_SYNC, SET_SYNC4, SET_INVERT, SET_BITREV, SET_RXGAIN, SET_PKTLEN,
 	SET_FREQ,
-	SET_SQL, SET_N
+	SET_SQL, SET_SWEEP, SET_N
 };
 
 static const char *const setNames[SET_N] = {
@@ -768,7 +805,7 @@ static const char *const setNames[SET_N] = {
 	// SET_FREQ comes before SET_SQL in the enum above. These two were the wrong
 	// way round, so the row labelled FREQ stepped the squelch and the row
 	// labelled SQL LEVEL stepped the frequency.
-	"FREQ MHz", "SQL LEVEL"
+	"FREQ MHz", "SQL LEVEL", "SWEEP"
 };
 
 static void SetValueString(uint8_t idx, char *s)
@@ -794,12 +831,46 @@ static void SetValueString(uint8_t idx, char *s)
 		case SET_RXGAIN:   sprintf(s, "%u", cfg.rxgain); break;
 		case SET_PKTLEN:   sprintf(s, "%u B", cfg.pktlen); break;
 		case SET_SQL:      sprintf(s, "%u.%u", gEeprom.SQUELCH_LEVEL, gEeprom.SQUELCH_TENTHS); break;
+		case SET_SWEEP:    strcpy(s, onoff[sweeping]); break;
 		case SET_FREQ: {
 			const uint32_t f = gRxVfo->pRX->Frequency;
 			sprintf(s, "%u.%03u", (unsigned)(f / 100000u), (unsigned)((f % 100000u) / 100u));
 			break;
 		}
 		default: s[0] = 0; break;
+	}
+}
+
+static void SweepApply(void)
+{
+	cfg.sync   = (uint8_t)(sweepIdx & 3u);
+	cfg.invert = (sweepIdx & 4u) != 0;
+	cfg.sync4  = (sweepIdx & 8u) != 0;
+	cfg.mode   = (uint8_t)((sweepIdx >> 4) & 3u);
+	sweepSyncMark = stats.syncs;
+	sweepAge10ms  = 0;
+	ModemArm();
+}
+
+static void SweepSetRunning(bool on)
+{
+	if (on == sweeping)
+		return;
+	if (on) {
+		sweepSaved[0] = cfg.mode;
+		sweepSaved[1] = cfg.sync;
+		sweepSaved[2] = cfg.invert ? 1u : 0u;
+		sweepSaved[3] = cfg.sync4 ? 1u : 0u;
+		sweeping = true;
+		sweepIdx = 0;
+		SweepApply();
+	} else {
+		sweeping   = false;
+		cfg.mode   = sweepSaved[0];
+		cfg.sync   = sweepSaved[1];
+		cfg.invert = sweepSaved[2] != 0;
+		cfg.sync4  = sweepSaved[3] != 0;
+		ModemArm();
 	}
 }
 
@@ -887,6 +958,7 @@ static void ChangeSetting(uint8_t idx, int dir)
 			break;
 		}
 		case SET_SQL:      StepSquelch(dir); break;
+		case SET_SWEEP:    SweepSetRunning(!sweeping); break;
 		default: break;
 	}
 	if (rearm && cfg.input == INPUT_MODEM)
@@ -1014,6 +1086,7 @@ void APP_RunAlert(void)
 	historyCount = 0;
 	// These are statics, so without this they carry over from the last run.
 	dbgLoop = 0; dbgIrqCount = 0; dbgKeyCount = 0;
+	sweeping = false; sweepIdx = 0; sweepAge10ms = 0; sweepSyncMark = 0;
 	lastCapLen = 0; capturing = false; capLen = 0; capAge10ms = 0;
 	tick = 0;
 
@@ -1112,6 +1185,17 @@ void APP_RunAlert(void)
 				keyHeld10ms = 0;
 			}
 
+			if (sweeping && ++sweepAge10ms >= SWEEP_DWELL) {
+				char sb[64];
+				sprintf(sb, "W %u m%u s%u i%u f%u S%u\r\n", sweepIdx, cfg.mode, cfg.sync,
+				        cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u,
+				        (unsigned)(stats.syncs - sweepSyncMark));
+				DbgSend(sb);
+				sweepIdx = (uint8_t)((sweepIdx + 1u) % SWEEP_N);
+				SweepApply();
+				redraw = true;
+			}
+
 			// A burst shorter than the programmed packet length never raises
 			// RX_FINISHED, so without this the first sync of the session latches
 			// capturing true and nothing is ever decoded again.
@@ -1154,6 +1238,8 @@ void APP_RunAlert(void)
 #else
 	ModemStop();
 #endif
+	if (sweeping)
+		SweepSetRunning(false);   // never store an arrangement the sweep chose
 	BK4819_WriteRegister(BK4819_REG_3F, 0);
 	BK4819_WriteRegister(BK4819_REG_02, 0);
 	ALERT_StoreConfig();
