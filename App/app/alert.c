@@ -173,17 +173,33 @@ static uint16_t capAge10ms;      // 10 ms ticks since the sync word, for the wat
 // over USB, so one long transmission answers "can this engine lock onto the
 // signal under any setting" instead of thirty-two flashes. Never persisted:
 // the settings in force when it started are put back when it stops.
+// A fixed dwell was the wrong shape. Bursts arrive perhaps once every seven
+// seconds, so 1.5 s per arrangement gave most of the 64 no signal at all to
+// judge them on, and a score of zero meant "never tested" far more often
+// than "does not work". Each arrangement now waits until it has actually
+// seen SWEEP_BURSTS transmissions, with a ceiling so a dead band cannot stall
+// the sweep forever.
 #define SWEEP_N       64u
-#define SWEEP_DWELL   150u        // 10 ms ticks, so 1.5 s per arrangement
+#define SWEEP_BURSTS  3u
+#define SWEEP_MAX10MS 2000u       // 20 s ceiling per arrangement
 static bool     sweeping;
 static uint8_t  sweepIdx;
 static uint16_t sweepAge10ms;
 static uint16_t sweepSyncMark;
+static uint16_t sweepBurstMark;
 static uint8_t  sweepSaved[4];   // mode, sync, invert, sync4
+// Scores survive the run. Losing a sweep because nothing happened to be
+// listening on USB at the time has already cost two sessions, so the result
+// is kept in RAM and shown on the screen as well as streamed.
+static uint8_t  sweepScore[SWEEP_N];
+static uint8_t  sweepBestIdx;
+static uint8_t  sweepBestScore;
 static bool     capGate;         // squelch was open at some point during the capture
 static int16_t  capRssi;
 
 static bool     sqOpen;
+static bool     sqPrev;         // for edge detection: bursts, not samples
+static uint16_t burstCount;     // squelch openings since entering the app
 static int16_t  rssiDbm;
 static bool     running;
 static bool     redraw;
@@ -351,6 +367,9 @@ static void ModemPoll(void)
 {
 	// squelch state straight from the chip: REG_0C<1> 1 = open
 	sqOpen = (BK4819_ReadRegister(BK4819_REG_0C) & 2u) != 0;
+	if (sqOpen && !sqPrev)
+		burstCount++;   // rising edge = one transmission arrived
+	sqPrev = sqOpen;
 	if (capturing && sqOpen)
 		capGate = true;
 
@@ -742,8 +761,17 @@ static void DrawMain(void)
 		        cfg.voice ? "VOICE" : "QUIET");
 		UI_PrintStringSmallNormal(s, 0, 127, 5);
 		if (sweeping) {
-			sprintf(s, "SWEEP %u/%u M%u S%u I%u L%u", sweepIdx + 1u, (unsigned)SWEEP_N,
-			        cfg.mode, cfg.sync, cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u);
+			sprintf(s, "SW %u/%u M%uS%uI%uL%u B%u", sweepIdx + 1u, (unsigned)SWEEP_N,
+			        cfg.mode, cfg.sync, cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u,
+			        (unsigned)(uint16_t)(burstCount - sweepBurstMark));
+			UI_PrintStringSmallNormal(s, 0, 0, 4);
+		} else if (sweepBestScore) {
+			// the winning arrangement, left on the glass so it can be read back
+			// hours later without anyone having captured the serial stream
+			sprintf(s, "BEST M%u S%u I%u L%u =%u",
+			        (unsigned)((sweepBestIdx >> 4) & 3u), (unsigned)(sweepBestIdx & 3u),
+			        (unsigned)((sweepBestIdx >> 2) & 1u), (unsigned)((sweepBestIdx >> 3) & 1u),
+			        sweepBestScore);
 			UI_PrintStringSmallNormal(s, 0, 0, 4);
 		}
 
@@ -847,8 +875,9 @@ static void SweepApply(void)
 	cfg.invert = (sweepIdx & 4u) != 0;
 	cfg.sync4  = (sweepIdx & 8u) != 0;
 	cfg.mode   = (uint8_t)((sweepIdx >> 4) & 3u);
-	sweepSyncMark = stats.syncs;
-	sweepAge10ms  = 0;
+	sweepSyncMark  = stats.syncs;
+	sweepBurstMark = burstCount;
+	sweepAge10ms   = 0;
 	ModemArm();
 }
 
@@ -863,6 +892,9 @@ static void SweepSetRunning(bool on)
 		sweepSaved[3] = cfg.sync4 ? 1u : 0u;
 		sweeping = true;
 		sweepIdx = 0;
+		memset(sweepScore, 0, sizeof(sweepScore));
+		sweepBestIdx = 0;
+		sweepBestScore = 0;
 		SweepApply();
 	} else {
 		sweeping   = false;
@@ -1087,6 +1119,9 @@ void APP_RunAlert(void)
 	// These are statics, so without this they carry over from the last run.
 	dbgLoop = 0; dbgIrqCount = 0; dbgKeyCount = 0;
 	sweeping = false; sweepIdx = 0; sweepAge10ms = 0; sweepSyncMark = 0;
+	sweepBurstMark = 0; sweepBestIdx = 0; sweepBestScore = 0;
+	memset(sweepScore, 0, sizeof(sweepScore));
+	burstCount = 0; sqPrev = false;
 	lastCapLen = 0; capturing = false; capLen = 0; capAge10ms = 0;
 	tick = 0;
 
@@ -1185,13 +1220,32 @@ void APP_RunAlert(void)
 				keyHeld10ms = 0;
 			}
 
-			if (sweeping && ++sweepAge10ms >= SWEEP_DWELL) {
-				char sb[64];
-				sprintf(sb, "W %u m%u s%u i%u f%u S%u\r\n", sweepIdx, cfg.mode, cfg.sync,
-				        cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u,
-				        (unsigned)(stats.syncs - sweepSyncMark));
+			sweepAge10ms++;
+			if (sweeping && ((uint16_t)(burstCount - sweepBurstMark) >= SWEEP_BURSTS
+			                 || sweepAge10ms >= SWEEP_MAX10MS)) {
+				const unsigned got = (unsigned)(uint16_t)(stats.syncs - sweepSyncMark);
+				const unsigned saw = (unsigned)(uint16_t)(burstCount - sweepBurstMark);
+				char sb[72];
+				sweepScore[sweepIdx] = (uint8_t)(got > 255u ? 255u : got);
+				if (sweepScore[sweepIdx] > sweepBestScore) {
+					sweepBestScore = sweepScore[sweepIdx];
+					sweepBestIdx   = sweepIdx;
+				}
+				sprintf(sb, "W %u m%u s%u i%u f%u S%u B%u\r\n", sweepIdx, cfg.mode, cfg.sync,
+				        cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u, got, saw);
 				DbgSend(sb);
 				sweepIdx = (uint8_t)((sweepIdx + 1u) % SWEEP_N);
+				if (sweepIdx == 0) {
+					// a full pass: dump the whole table so it is on the wire once,
+					// whether or not anything was listening for the running commentary
+					for (uint8_t i = 0; i < SWEEP_N; i += 8) {
+						sprintf(sb, "T %u %u %u %u %u %u %u %u %u\r\n", i,
+						        sweepScore[i + 0], sweepScore[i + 1], sweepScore[i + 2],
+						        sweepScore[i + 3], sweepScore[i + 4], sweepScore[i + 5],
+						        sweepScore[i + 6], sweepScore[i + 7]);
+						DbgSend(sb);
+					}
+				}
 				SweepApply();
 				redraw = true;
 			}
@@ -1217,10 +1271,15 @@ void APP_RunAlert(void)
 				ST7565_FixInterfGlitch();
 				redraw = true;
 				{
-					char hb[80];
-					sprintf(hb, "D I%u S%u F%u G%u X%u B%u R%d Q%u\r\n",
+					char hb[112];
+					// The arrangement goes out with every heartbeat. Without it a
+					// capture cannot be attributed to the settings that produced it,
+					// which made the first set of dumps much less useful than it
+					// should have been.
+					sprintf(hb, "D I%u S%u F%u G%u X%u B%u R%d Q%u N%u m%u y%u v%u l%u\r\n",
 					        dbgIrqCount, stats.syncs, stats.frames, stats.gated,
-					        stats.stuck, lastCapLen, rssiDbm, sqOpen ? 1u : 0u);
+					        stats.stuck, lastCapLen, rssiDbm, sqOpen ? 1u : 0u, burstCount,
+					        cfg.mode, cfg.sync, cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u);
 					DbgSend(hb);
 				}
 			}
