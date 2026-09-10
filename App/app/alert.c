@@ -181,7 +181,12 @@ static uint16_t capAge10ms;      // 10 ms ticks since the sync word, for the wat
 // the sweep forever.
 #define SWEEP_N       64u
 #define SWEEP_BURSTS  3u
-#define SWEEP_MAX10MS 2000u       // 20 s ceiling per arrangement
+// No time ceiling any more. Transmissions arrived about once every 17 s, so a
+// 20 s ceiling meant most arrangements were scored on nothing at all. The
+// sweep now paces itself to the signal: it holds until it has seen three real
+// bursts and says so on the screen, which is honest about needing a human to
+// key up and cannot manufacture a zero out of silence.
+#define SWEEP_NAG10MS 800u        // say something after 8 s of quiet
 static bool     sweeping;
 static uint8_t  sweepIdx;
 static uint16_t sweepAge10ms;
@@ -192,6 +197,7 @@ static uint8_t  sweepSaved[4];   // mode, sync, invert, sync4
 // listening on USB at the time has already cost two sessions, so the result
 // is kept in RAM and shown on the screen as well as streamed.
 static uint8_t  sweepScore[SWEEP_N];
+static uint8_t  sweepSeen[SWEEP_N];    // qualifying bursts each one was judged on
 static uint8_t  sweepBestIdx;
 static uint8_t  sweepBestScore;
 static bool     capGate;         // squelch was open at some point during the capture
@@ -199,7 +205,17 @@ static int16_t  capRssi;
 
 static bool     sqOpen;
 static bool     sqPrev;         // for edge detection: bursts, not samples
-static uint16_t burstCount;     // squelch openings since entering the app
+static uint16_t burstCount;     // qualifying bursts since entering the app
+// A squelch opening is not the same thing as a transmission. At SQL 1.0 the
+// squelch flickers on noise, and a sweep that counted those advanced happily
+// through eight arrangements with nothing on the air, scoring every one of
+// them zero - indistinguishable from "tried it, does not work". A burst only
+// counts if it rose well clear of the noise, and the floor is measured rather
+// than assumed so it works wherever the radio happens to be.
+#define BURST_MARGIN_DB 15
+static int16_t  rssiFloor = 0;  // slow minimum: the noise floor, in dBm
+static int16_t  burstPeak;      // strongest RSSI during the burst in progress
+static int16_t  lastPeak;       // ... of the last qualifying burst, for display
 static int16_t  rssiDbm;
 static bool     running;
 static bool     redraw;
@@ -367,8 +383,18 @@ static void ModemPoll(void)
 {
 	// squelch state straight from the chip: REG_0C<1> 1 = open
 	sqOpen = (BK4819_ReadRegister(BK4819_REG_0C) & 2u) != 0;
-	if (sqOpen && !sqPrev)
-		burstCount++;   // rising edge = one transmission arrived
+	if (sqOpen) {
+		if (!sqPrev)
+			burstPeak = -127;
+		if (rssiDbm > burstPeak)
+			burstPeak = rssiDbm;
+	} else if (sqPrev) {
+		// falling edge: judge the burst that just ended
+		if (burstPeak >= (int16_t)(rssiFloor + BURST_MARGIN_DB)) {
+			burstCount++;
+			lastPeak = burstPeak;
+		}
+	}
 	sqPrev = sqOpen;
 	if (capturing && sqOpen)
 		capGate = true;
@@ -781,7 +807,12 @@ static void DrawMain(void)
 		sprintf(s, "%u.%05u MHz", (unsigned)(f / 100000u), (unsigned)(f % 100000u));
 		UI_PrintStringSmallNormal(s, 0, 127, 0);
 
-		UI_PrintStringSmallNormal(sweeping ? "SWEEPING" : "WAITING FOR ALERT", 0, 127, 1);
+		// When the sweep is starved it says so, rather than quietly banking
+		// zeroes that look like results.
+		UI_PrintStringSmallNormal(
+			!sweeping                     ? "WAITING FOR ALERT" :
+			(sweepAge10ms > SWEEP_NAG10MS) ? "SWEEP: SEND NOW"   : "SWEEPING",
+			0, 127, 1);
 
 		// S rises when the FSK engine finds the sync word, B is the size of the
 		// last capture in bits - B still 0 with S climbing means the engine syncs
@@ -795,8 +826,11 @@ static void DrawMain(void)
 		UI_PrintStringSmallNormal(s, 0, 0, 3);
 
 		if (sweeping) {
-			sprintf(s, "SW%u/%u b%u", sweepIdx + 1u, (unsigned)SWEEP_N,
-			        (unsigned)(uint16_t)(burstCount - sweepBurstMark));
+			// b: qualifying bursts this arrangement has had, of SWEEP_BURSTS.
+			// P: peak of the last one, so it is obvious whether a transmission is
+			// getting through at all.
+			sprintf(s, "SW%u/%u b%u P%d", sweepIdx + 1u, (unsigned)SWEEP_N,
+			        (unsigned)(uint16_t)(burstCount - sweepBurstMark), lastPeak);
 			UI_PrintStringSmallNormal(s, 0, 0, 4);
 		} else if (sweepBestScore) {
 			// the winning arrangement, left on the glass so it can be read back
@@ -917,6 +951,7 @@ static void SweepSetRunning(bool on)
 		sweeping = true;
 		sweepIdx = 0;
 		memset(sweepScore, 0, sizeof(sweepScore));
+		memset(sweepSeen, 0, sizeof(sweepSeen));
 		sweepBestIdx = 0;
 		sweepBestScore = 0;
 		SweepApply();
@@ -1160,7 +1195,9 @@ void APP_RunAlert(void)
 	sweeping = false; sweepIdx = 0; sweepAge10ms = 0; sweepSyncMark = 0;
 	sweepBurstMark = 0; sweepBestIdx = 0; sweepBestScore = 0;
 	memset(sweepScore, 0, sizeof(sweepScore));
+	memset(sweepSeen, 0, sizeof(sweepSeen));
 	burstCount = 0; sqPrev = false;
+	rssiFloor = 0; burstPeak = -127; lastPeak = -127;
 	lastCapLen = 0; capturing = false; capLen = 0; capAge10ms = 0;
 	tick = 0;
 
@@ -1260,12 +1297,12 @@ void APP_RunAlert(void)
 			}
 
 			sweepAge10ms++;
-			if (sweeping && ((uint16_t)(burstCount - sweepBurstMark) >= SWEEP_BURSTS
-			                 || sweepAge10ms >= SWEEP_MAX10MS)) {
+			if (sweeping && (uint16_t)(burstCount - sweepBurstMark) >= SWEEP_BURSTS) {
 				const unsigned got = (unsigned)(uint16_t)(stats.syncs - sweepSyncMark);
 				const unsigned saw = (unsigned)(uint16_t)(burstCount - sweepBurstMark);
 				char sb[72];
 				sweepScore[sweepIdx] = (uint8_t)(got > 255u ? 255u : got);
+				sweepSeen[sweepIdx]  = (uint8_t)(saw > 255u ? 255u : saw);
 				if (sweepScore[sweepIdx] > sweepBestScore) {
 					sweepBestScore = sweepScore[sweepIdx];
 					sweepBestIdx   = sweepIdx;
@@ -1283,6 +1320,13 @@ void APP_RunAlert(void)
 						        sweepScore[i + 3], sweepScore[i + 4], sweepScore[i + 5],
 						        sweepScore[i + 6], sweepScore[i + 7]);
 						DbgSend(sb);
+						// how many real bursts each was judged on: a score of zero
+						// against zero bursts means untested, not unworkable
+						sprintf(sb, "U %u %u %u %u %u %u %u %u %u\r\n", i,
+						        sweepSeen[i + 0], sweepSeen[i + 1], sweepSeen[i + 2],
+						        sweepSeen[i + 3], sweepSeen[i + 4], sweepSeen[i + 5],
+						        sweepSeen[i + 6], sweepSeen[i + 7]);
+						DbgSend(sb);
 					}
 				}
 				SweepApply();
@@ -1297,10 +1341,16 @@ void APP_RunAlert(void)
 				FinishCapture();
 			}
 
-			if ((++tick % 10) == 0) {
-				rssiDbm = BK4819_GetRSSI_dBm();
+			// Every 10 ms, not every 100: a burst can be shorter than the old
+			// sampling interval, which is how transmissions at -16 dBm went by
+			// with the reading never leaving the noise floor.
+			rssiDbm = BK4819_GetRSSI_dBm();
+			if (rssiFloor == 0 || rssiDbm < rssiFloor)
+				rssiFloor = rssiDbm;
+			if ((++tick % 500) == 0 && rssiFloor < 0)
+				rssiFloor++;          // let the floor drift back up over 5 s steps
+			if ((tick % 10) == 0)
 				DrawStatus();
-			}
 			if ((tick % 50) == 0) {
 				// The ST7565 loses its register state when the BK4819 changes RF
 				// state; this fork re-sends the init list after TX and after
@@ -1315,10 +1365,11 @@ void APP_RunAlert(void)
 					// capture cannot be attributed to the settings that produced it,
 					// which made the first set of dumps much less useful than it
 					// should have been.
-					sprintf(hb, "D I%u S%u F%u G%u X%u B%u R%d Q%u N%u m%u y%u v%u l%u\r\n",
+					sprintf(hb, "D I%u S%u F%u G%u X%u B%u R%d Q%u N%u m%u y%u v%u l%u f%d p%d\r\n",
 					        dbgIrqCount, stats.syncs, stats.frames, stats.gated,
 					        stats.stuck, lastCapLen, rssiDbm, sqOpen ? 1u : 0u, burstCount,
-					        cfg.mode, cfg.sync, cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u);
+					        cfg.mode, cfg.sync, cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u,
+					        rssiFloor, lastPeak);
 					DbgSend(hb);
 				}
 			}
