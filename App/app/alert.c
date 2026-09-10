@@ -727,20 +727,41 @@ static void FormatValue(char *out, uint16_t value, uint8_t kind)
 	}
 }
 
+// The small font is 6 px wide with 1 px of spacing, so a character costs 7 px
+// and the 128 px line holds eighteen of them. Both halves of this line ignored
+// that: "ALERT MDM" at column 0 is 63 px wide and the reading was placed at
+// column 60, so they were drawn on top of each other, and "%4ddBm SQ" needs
+// 70 px from column 60, which is two past the end of the line. The columns
+// below are picked from the widths, with the reading right-aligned into the
+// space that is left.
+#define ST_CHAR   7u
+#define ST_COL_IN (6u * ST_CHAR)     // 42: clear of "ALERT"
+#define ST_COL_SQ (16u * ST_CHAR)    // 112: last two cells
 static void DrawStatus(void)
 {
-	char s[24];
+	char s[16];
 	memset(gStatusLine, 0, sizeof(gStatusLine));
-	sprintf(s, "ALERT %s", cfg.input == INPUT_ADC ? "ADC" : "MDM");
-	UI_PrintStringSmallBufferNormal(s, gStatusLine + 0);
-	sprintf(s, "%4ddBm %s", rssiDbm, sqOpen ? "SQ" : "  ");
-	UI_PrintStringSmallBufferNormal(s, gStatusLine + 60);
+
+	UI_PrintStringSmallBufferNormal("ALERT", gStatusLine + 0);
+	UI_PrintStringSmallBufferNormal(cfg.input == INPUT_ADC ? "ADC" : "MDM",
+	                                gStatusLine + ST_COL_IN);
+
+	sprintf(s, "%ddBm", rssiDbm);
+	{	// right-align, but never start before the input label ends
+		unsigned int col = (unsigned int)(ST_COL_SQ - strlen(s) * ST_CHAR);
+		if (col < ST_COL_IN + 4u * ST_CHAR)
+			col = ST_COL_IN + 4u * ST_CHAR;
+		UI_PrintStringSmallBufferNormal(s, gStatusLine + col);
+	}
+
 	if (capturing
 #ifdef ENABLE_ALERT_ADC
 	    || adc.active
 #endif
 	   )
-		UI_PrintStringSmallBufferNormal("*", gStatusLine + 122);
+		UI_PrintStringSmallBufferNormal("*", gStatusLine + ST_COL_SQ + ST_CHAR);
+	else if (sqOpen)
+		UI_PrintStringSmallBufferNormal("+", gStatusLine + ST_COL_SQ + ST_CHAR);
 	ST7565_BlitStatusLine();
 }
 
@@ -751,42 +772,44 @@ static void DrawMain(void)
 	UI_DisplayClear();
 
 	if (historyCount == 0) {
+		// Row 6 is deliberately left empty. On this radio the bottom row of the
+		// glass sits partly under the bezel, so anything printed there cannot be
+		// read - which is exactly where the counters used to go. Everything that
+		// has to be legible lives in rows 0..5, and no line here exceeds the
+		// eighteen characters the small font fits across 128 px.
 		const uint32_t f = gRxVfo->pRX->Frequency;
 		sprintf(s, "%u.%05u MHz", (unsigned)(f / 100000u), (unsigned)(f % 100000u));
 		UI_PrintStringSmallNormal(s, 0, 127, 0);
-		UI_PrintStringSmallNormal("WAITING FOR ALERT", 0, 127, 2);
-		sprintf(s, "%u SITES", ALERT_StationCount());
-		UI_PrintStringSmallNormal(s, 0, 127, 3);
-		sprintf(s, "SQL %u.%u  %s", gEeprom.SQUELCH_LEVEL, gEeprom.SQUELCH_TENTHS,
-		        cfg.voice ? "VOICE" : "QUIET");
-		UI_PrintStringSmallNormal(s, 0, 127, 5);
+
+		UI_PrintStringSmallNormal(sweeping ? "SWEEPING" : "WAITING FOR ALERT", 0, 127, 1);
+
+		// S rises when the FSK engine finds the sync word, B is the size of the
+		// last capture in bits - B still 0 with S climbing means the engine syncs
+		// but no bytes ever leave the FIFO - F is decoded frames and G captures
+		// thrown away by the squelch gate.
+		sprintf(s, "S%u B%u F%u G%u", stats.syncs, lastCapLen, stats.frames, stats.gated);
+		UI_PrintStringSmallNormal(s, 0, 0, 2);
+
+		sprintf(s, "M%uS%uI%uL%u SQL%u.%u", cfg.mode, cfg.sync, cfg.invert ? 1u : 0u,
+		        cfg.sync4 ? 1u : 0u, gEeprom.SQUELCH_LEVEL, gEeprom.SQUELCH_TENTHS);
+		UI_PrintStringSmallNormal(s, 0, 0, 3);
+
 		if (sweeping) {
-			sprintf(s, "SW %u/%u M%uS%uI%uL%u B%u", sweepIdx + 1u, (unsigned)SWEEP_N,
-			        cfg.mode, cfg.sync, cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u,
+			sprintf(s, "SW%u/%u b%u", sweepIdx + 1u, (unsigned)SWEEP_N,
 			        (unsigned)(uint16_t)(burstCount - sweepBurstMark));
 			UI_PrintStringSmallNormal(s, 0, 0, 4);
 		} else if (sweepBestScore) {
 			// the winning arrangement, left on the glass so it can be read back
 			// hours later without anyone having captured the serial stream
-			sprintf(s, "BEST M%u S%u I%u L%u =%u",
+			sprintf(s, "BEST M%uS%uI%uL%u=%u",
 			        (unsigned)((sweepBestIdx >> 4) & 3u), (unsigned)(sweepBestIdx & 3u),
 			        (unsigned)((sweepBestIdx >> 2) & 1u), (unsigned)((sweepBestIdx >> 3) & 1u),
 			        sweepBestScore);
 			UI_PrintStringSmallNormal(s, 0, 0, 4);
 		}
 
-		// Diagnostics on the last line. K rises if the key matrix reaches this
-		// app at all, I rises when the BK4819 raises an interrupt, and the two
-		// flags show squelch and capture state.
-		// L is the liveness proof: it increments every pass of the main loop, so
-		// a frozen L means the app is stuck, not merely idle. k is the raw
-		// KEYBOARD_Poll() value this instant, P the PTT pin read directly.
-		// S rises when the FSK engine finds the sync word, B is the size of the
-		// last capture in bits - B still 0 with S climbing means the engine syncs
-		// but no bytes ever leave the FIFO - F is decoded frames and G captures
-		// thrown away by the squelch gate.
-		sprintf(s, "S%u B%u F%u G%u", stats.syncs, lastCapLen, stats.frames, stats.gated);
-		UI_PrintStringSmallNormal(s, 0, 0, 6);   // End=0: left-aligned, no centring arithmetic
+		sprintf(s, "%u SITES %s", ALERT_StationCount(), cfg.voice ? "VOICE" : "QUIET");
+		UI_PrintStringSmallNormal(s, 0, 0, 5);
 	} else {
 		const History_t *h = &history[0];
 		const char *name; uint8_t kind;
@@ -796,7 +819,7 @@ static void DrawMain(void)
 		if (name[0]) {
 			UI_PrintStringSmallNormal(name, 0, 0, 0);
 		} else {
-			sprintf(s, "ID %u NOT IN TABLE", h->id);
+			sprintf(s, "ID %u UNKNOWN", h->id);   // "NOT IN TABLE" ran to 20
 			UI_PrintStringSmallNormal(s, 0, 0, 0);
 		}
 		FormatValue(s, h->value, h->kind);
@@ -806,13 +829,14 @@ static void DrawMain(void)
 		sprintf(s, "#%u", h->id);
 		UI_PrintStringSmallNormal(s, 88, 0, 2);
 
-		// lines 3..6: history
-		for (uint8_t i = 0; i < 4 && i < historyCount; i++) {
+		// rows 3..5: history. Row 6 is under the bezel, see above.
+		for (uint8_t i = 0; i < 3 && i < historyCount; i++) {
 			const History_t *e = &history[i];
 			const char *n2; uint8_t k2; char v[16];
 			ALERT_LookupStation(e->id, &n2, &k2);
 			FormatValue(v, e->value, e->kind);
-			sprintf(s, "%4u %-9.9s %6s", e->id, n2[0] ? n2 : "?", v);
+			// 4 + 1 + 7 + 1 + 5 = 18, exactly what fits. It was 21.
+			sprintf(s, "%4u %-7.7s %5s", e->id, n2[0] ? n2 : "?", v);
 			UI_PrintStringSmallNormal(s, 0, 0, 3 + i);
 		}
 	}
@@ -1002,41 +1026,56 @@ static void DrawSettings(void)
 	char s[24], v[16];
 	UI_DisplayClear();
 	UI_PrintStringSmallNormal("ALERT SETTINGS", 0, 127, 0);
-	// show a window of 6 rows around the selection
-	uint8_t first = (setIndex >= 5) ? (uint8_t)(setIndex - 5) : 0;
-	if (first > SET_N - 6) first = SET_N - 6;
-	for (uint8_t i = 0; i < 6; i++) {
+	// A window of five rows, not six: row 6 is under the bezel on this radio
+	// and the selected row could land there and be invisible.
+	uint8_t first = (setIndex >= 4) ? (uint8_t)(setIndex - 4) : 0;
+	if (first > SET_N - 5) first = SET_N - 5;
+	for (uint8_t i = 0; i < 5; i++) {
 		const uint8_t idx = (uint8_t)(first + i);
 		SetValueString(idx, v);
-		sprintf(s, "%c%-9s %s", idx == setIndex ? '>' : ' ', setNames[idx], v);
+		// 1 + 9 + 8 = 18. The separating space made it 19: the longest name
+		// ("SQL LEVEL") and the longest value ("BK MODEM") together fill the row.
+		sprintf(s, "%c%-9s%s", idx == setIndex ? '>' : ' ', setNames[idx], v);
 		UI_PrintStringSmallNormal(s, 0, 0, 1 + i);
 	}
 	ST7565_BlitFullScreen();
 }
 
+// Six usable rows, eighteen characters each. "GATED 255 UNK 255 ST 255" was
+// twenty-four and would have been clipped; the counters are one compact row
+// now, and the arrangement rides on the title row instead of costing its own.
 static void DrawRaw(void)
 {
 	char s[28];
 	UI_DisplayClear();
-	UI_PrintStringSmallNormal("RAW CAPTURE", 0, 127, 0);
-	sprintf(s, "SYNC %u  FRM %u", stats.syncs, stats.frames);
+
+	sprintf(s, "RAW  M%uS%uI%uL%u", cfg.mode, cfg.sync,
+	        cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u);
+	UI_PrintStringSmallNormal(s, 0, 0, 0);
+
+	sprintf(s, "S%u F%u G%u U%u X%u", stats.syncs, stats.frames, stats.gated,
+	        stats.unknown, stats.stuck);
 	UI_PrintStringSmallNormal(s, 0, 0, 1);
-	sprintf(s, "GATED %u UNK %u ST %u", stats.gated, stats.unknown, stats.stuck);
-	UI_PrintStringSmallNormal(s, 0, 0, 2);
+
 	sprintf(s, "LAST %u BITS", lastCapLen);
+	UI_PrintStringSmallNormal(s, 0, 0, 2);
+
+	sprintf(s, "%02X%02X%02X%02X %02X%02X%02X%02X", lastCap[0], lastCap[1], lastCap[2],
+	        lastCap[3], lastCap[4], lastCap[5], lastCap[6], lastCap[7]);
 	UI_PrintStringSmallNormal(s, 0, 0, 3);
-	sprintf(s, "%02X%02X %02X%02X %02X%02X %02X%02X", lastCap[0], lastCap[1], lastCap[2], lastCap[3],
-	        lastCap[4], lastCap[5], lastCap[6], lastCap[7]);
-	UI_PrintStringSmallNormal(s, 0, 0, 4);
-	{	// first 20 bits as 0/1 so the preamble/start bits can be eyeballed
+
+	{	// the first eighteen bits as 0/1, so the preamble and start bits can be
+		// eyeballed. Eighteen because that is what fits across 128 px.
 		uint8_t i;
-		for (i = 0; i < 20; i++)
+		for (i = 0; i < 18; i++)
 			s[i] = ALERT_GetBit(lastCap, i) ? '1' : '0';
 		s[i] = 0;
-		UI_PrintStringSmallNormal(s, 0, 0, 5);
+		UI_PrintStringSmallNormal(s, 0, 0, 4);
 	}
-	sprintf(s, "%s %u BD", cfg.input == INPUT_ADC ? "ADC" : "MODEM", cfg.baud);
-	UI_PrintStringSmallNormal(s, 0, 0, 6);
+
+	sprintf(s, "%s %uBD SQL%u.%u", cfg.input == INPUT_ADC ? "ADC" : "MDM", cfg.baud,
+	        gEeprom.SQUELCH_LEVEL, gEeprom.SQUELCH_TENTHS);
+	UI_PrintStringSmallNormal(s, 0, 0, 5);
 	ST7565_BlitFullScreen();
 }
 
