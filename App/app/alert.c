@@ -972,6 +972,14 @@ static void SweepSetRunning(bool on)
 		sweepBestIdx = 0;
 		sweepBestScore = 0;
 		SweepApply();
+	} else if (sweepBestScore) {
+		// Adopt what the sweep found. Putting the previous settings back made
+		// sense while a score could be manufactured out of silence; now that a
+		// score means real bursts went through that arrangement, discarding
+		// the answer and restoring the earlier guess is just perverse.
+		sweeping = false;
+		sweepIdx = sweepBestIdx;
+		SweepApply();
 	} else {
 		sweeping   = false;
 		cfg.mode   = sweepSaved[0];
