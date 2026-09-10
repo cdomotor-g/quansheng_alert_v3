@@ -179,8 +179,27 @@ static uint16_t capAge10ms;      // 10 ms ticks since the sync word, for the wat
 // than "does not work". Each arrangement now waits until it has actually
 // seen SWEEP_BURSTS transmissions, with a ceiling so a dead band cannot stall
 // the sweep forever.
-#define SWEEP_N       64u
-#define SWEEP_BURSTS  3u
+// Sixteen arrangements, not sixty-four. Two of the four axes are redundant,
+// and provably so rather than by guess:
+//
+//   invert. Inverting RX data makes the detector match the complement of the
+//   sync word, and the four sync values are closed under complement -
+//   0000<->FFFF, AAAA<->5555. Sweeping all four at invert=0 therefore covers
+//   every physical pattern invert=1 could reach. Where invert affects the
+//   captured bits rather than the sync match, ALERT_ScanBits already tries
+//   both polarities, so nothing is lost either way.
+//
+//   sync4. A four-byte sync word here is the same sixteen bits written to
+//   REG_5A and REG_5B, so a four-byte match is a strict subset of a two-byte
+//   match. If two bytes will not sync, four cannot.
+//
+// One qualifying burst advances an arrangement rather than three: sixteen
+// transmissions for a full pass instead of a hundred and ninety-two. Scores
+// accumulate across passes instead of resetting, so leaving it running - on a
+// frequency with real traffic, say - simply sharpens the answer, and the
+// tedium of keying up by hand is optional rather than structural.
+#define SWEEP_N       16u
+#define SWEEP_BURSTS  1u
 // No time ceiling any more. Transmissions arrived about once every 17 s, so a
 // 20 s ceiling meant most arrangements were scored on nothing at all. The
 // sweep now paces itself to the signal: it holds until it has seen three real
@@ -829,16 +848,14 @@ static void DrawMain(void)
 			// b: qualifying bursts this arrangement has had, of SWEEP_BURSTS.
 			// P: peak of the last one, so it is obvious whether a transmission is
 			// getting through at all.
-			sprintf(s, "SW%u/%u b%u P%d", sweepIdx + 1u, (unsigned)SWEEP_N,
-			        (unsigned)(uint16_t)(burstCount - sweepBurstMark), lastPeak);
+			sprintf(s, "SW%u/%u P%d", sweepIdx + 1u, (unsigned)SWEEP_N, lastPeak);
 			UI_PrintStringSmallNormal(s, 0, 0, 4);
 		} else if (sweepBestScore) {
 			// the winning arrangement, left on the glass so it can be read back
 			// hours later without anyone having captured the serial stream
-			sprintf(s, "BEST M%uS%uI%uL%u=%u",
-			        (unsigned)((sweepBestIdx >> 4) & 3u), (unsigned)(sweepBestIdx & 3u),
-			        (unsigned)((sweepBestIdx >> 2) & 1u), (unsigned)((sweepBestIdx >> 3) & 1u),
-			        sweepBestScore);
+			sprintf(s, "BEST M%u S%u =%u/%u",
+			        (unsigned)((sweepBestIdx >> 2) & 3u), (unsigned)(sweepBestIdx & 3u),
+			        sweepBestScore, sweepSeen[sweepBestIdx]);
 			UI_PrintStringSmallNormal(s, 0, 0, 4);
 		}
 
@@ -930,9 +947,9 @@ static void SetValueString(uint8_t idx, char *s)
 static void SweepApply(void)
 {
 	cfg.sync   = (uint8_t)(sweepIdx & 3u);
-	cfg.invert = (sweepIdx & 4u) != 0;
-	cfg.sync4  = (sweepIdx & 8u) != 0;
-	cfg.mode   = (uint8_t)((sweepIdx >> 4) & 3u);
+	cfg.mode   = (uint8_t)((sweepIdx >> 2) & 3u);
+	cfg.invert = false;   // covered by the sync word, see SWEEP_N
+	cfg.sync4  = false;   // two bytes is the permissive case
 	sweepSyncMark  = stats.syncs;
 	sweepBurstMark = burstCount;
 	sweepAge10ms   = 0;
@@ -1301,8 +1318,12 @@ void APP_RunAlert(void)
 				const unsigned got = (unsigned)(uint16_t)(stats.syncs - sweepSyncMark);
 				const unsigned saw = (unsigned)(uint16_t)(burstCount - sweepBurstMark);
 				char sb[72];
-				sweepScore[sweepIdx] = (uint8_t)(got > 255u ? 255u : got);
-				sweepSeen[sweepIdx]  = (uint8_t)(saw > 255u ? 255u : saw);
+				{	// accumulate, saturating: a second pass adds to the first
+					const unsigned sc = sweepScore[sweepIdx] + got;
+					const unsigned sn = sweepSeen[sweepIdx] + saw;
+					sweepScore[sweepIdx] = (uint8_t)(sc > 255u ? 255u : sc);
+					sweepSeen[sweepIdx]  = (uint8_t)(sn > 255u ? 255u : sn);
+				}
 				if (sweepScore[sweepIdx] > sweepBestScore) {
 					sweepBestScore = sweepScore[sweepIdx];
 					sweepBestIdx   = sweepIdx;
@@ -1315,7 +1336,7 @@ void APP_RunAlert(void)
 					// a full pass: dump the whole table so it is on the wire once,
 					// whether or not anything was listening for the running commentary
 					for (uint8_t i = 0; i < SWEEP_N; i += 8) {
-						sprintf(sb, "T %u %u %u %u %u %u %u %u %u\r\n", i,
+						sprintf(sb, "T %u  %u %u %u %u %u %u %u %u\r\n", i,
 						        sweepScore[i + 0], sweepScore[i + 1], sweepScore[i + 2],
 						        sweepScore[i + 3], sweepScore[i + 4], sweepScore[i + 5],
 						        sweepScore[i + 6], sweepScore[i + 7]);
