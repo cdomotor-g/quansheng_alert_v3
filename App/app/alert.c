@@ -19,7 +19,9 @@
 #include "driver/gpio.h"
 #include "driver/st7565.h"
 #include "driver/system.h"
+#include "board.h"
 #include "external/printf/printf.h"
+#include "py32f071_ll_adc.h"
 #include "functions.h"
 #include "misc.h"
 #include "radio.h"
@@ -212,6 +214,7 @@ static uint16_t sweepAge10ms;
 static uint16_t sweepSyncMark;
 static uint16_t sweepBurstMark;
 static uint8_t  sweepSaved[4];   // mode, sync, invert, sync4
+static uint16_t sweepSavedBaud;
 // Scores survive the run. Losing a sweep because nothing happened to be
 // listening on USB at the time has already cost two sessions, so the result
 // is kept in RAM and shown on the screen as well as streamed.
@@ -611,6 +614,67 @@ static void AdcPoll(void)
 #endif // ENABLE_ALERT_ADC
 
 // ---------------------------------------------------------------------------
+// audio hunt: does either analog pin carry the receiver's audio?
+//
+// The FSK sync detector will not lock onto this signal - seven transmissions at
+// -10 dBm against an -81 dBm floor produced no sync at all - so the route worth
+// having is the software demodulator, which needs no sync because it works on
+// audio samples. ALERT_AdcTick already implements it; what is missing on this
+// hardware is the samples.
+//
+// BOARD_ADC_Init puts both PB0 and PB1 into analog mode and only ever reads PB0
+// (channel 8, the battery), which makes channel 9 the obvious candidate. This
+// measures peak-to-peak on both while the squelch is open and while it is shut:
+// the pin carrying audio is the one that moves with the signal.
+//
+// Only those two channels are touched. Reconfiguring other pins to analog to go
+// hunting would mean changing pins that are driving the display or the radio,
+// and a probe is not worth breaking hardware for.
+
+static bool     probing;
+static uint16_t probePP8, probePP9;   // last peak-to-peak, per channel
+
+#define PROBE_SAMPLES 192u
+
+static uint16_t AdcProbe(uint32_t ch, uint16_t *pMin, uint16_t *pMax)
+{
+	uint16_t mn = 0xFFFFu, mx = 0;
+
+	LL_ADC_REG_SetSequencerRanks(ADC1, LL_ADC_REG_RANK_1, ch);
+	LL_ADC_SetChannelSamplingTime(ADC1, ch, LL_ADC_SAMPLINGTIME_13CYCLES_5);
+
+	for (unsigned int i = 0; i < PROBE_SAMPLES; i++) {
+		uint32_t guard = 20000;
+		LL_ADC_REG_StartConversionSWStart(ADC1);
+		while (!LL_ADC_IsActiveFlag_EOS(ADC1) && --guard)
+			;
+		if (!guard)
+			break;                        // never spin forever on the ADC
+		LL_ADC_ClearFlag_JEOS(ADC1);
+		const uint16_t v = LL_ADC_REG_ReadConversionData12(ADC1);
+		if (v < mn) mn = v;
+		if (v > mx) mx = v;
+	}
+	if (mn > mx) { mn = 0; mx = 0; }
+	*pMin = mn;
+	*pMax = mx;
+	return (uint16_t)(mx - mn);
+}
+
+static void ProbeOnce(void)
+{
+	uint16_t mn8, mx8, mn9, mx9;
+	char pb[80];
+
+	probePP8 = AdcProbe(LL_ADC_CHANNEL_8, &mn8, &mx8);
+	probePP9 = AdcProbe(LL_ADC_CHANNEL_9, &mn9, &mx9);
+
+	sprintf(pb, "P Q%u c8 %u-%u pp%u c9 %u-%u pp%u\r\n", sqOpen ? 1u : 0u,
+	        mn8, mx8, probePP8, mn9, mx9, probePP9);
+	DbgSend(pb);
+}
+
+// ---------------------------------------------------------------------------
 // decoded readings
 
 #ifdef ENABLE_VOICE
@@ -844,7 +908,11 @@ static void DrawMain(void)
 		        cfg.sync4 ? 1u : 0u, gEeprom.SQUELCH_LEVEL, gEeprom.SQUELCH_TENTHS);
 		UI_PrintStringSmallNormal(s, 0, 0, 3);
 
-		if (sweeping) {
+		if (probing) {
+			// The number that matters is c9 rising when the squelch opens.
+			sprintf(s, "AUD 8:%u 9:%u", probePP8, probePP9);
+			UI_PrintStringSmallNormal(s, 0, 0, 4);
+		} else if (sweeping) {
 			// b: qualifying bursts this arrangement has had, of SWEEP_BURSTS.
 			// P: peak of the last one, so it is obvious whether a transmission is
 			// getting through at all.
@@ -853,9 +921,12 @@ static void DrawMain(void)
 		} else if (sweepBestScore) {
 			// the winning arrangement, left on the glass so it can be read back
 			// hours later without anyone having captured the serial stream
-			sprintf(s, "BEST M%u S%u =%u/%u",
-			        (unsigned)((sweepBestIdx >> 2) & 3u), (unsigned)(sweepBestIdx & 3u),
-			        sweepBestScore, sweepSeen[sweepBestIdx]);
+			{
+				static const uint16_t bestBauds[4] = { 200, 300, 600, 1200 };
+				sprintf(s, "BEST S%u %uBD =%u/%u", (unsigned)(sweepBestIdx & 3u),
+				        bestBauds[(sweepBestIdx >> 2) & 3u],
+				        sweepBestScore, sweepSeen[sweepBestIdx]);
+			}
 			UI_PrintStringSmallNormal(s, 0, 0, 4);
 		}
 
@@ -899,7 +970,7 @@ enum {
 	SET_INPUT, SET_POLARITY, SET_VOICE, SET_GATE, SET_UNKNOWN, SET_CONFIRM, SET_MONITOR,
 	SET_MODE, SET_BAUD, SET_SYNC, SET_SYNC4, SET_INVERT, SET_BITREV, SET_RXGAIN, SET_PKTLEN,
 	SET_FREQ,
-	SET_SQL, SET_SWEEP, SET_N
+	SET_SQL, SET_SWEEP, SET_PROBE, SET_N
 };
 
 static const char *const setNames[SET_N] = {
@@ -908,7 +979,7 @@ static const char *const setNames[SET_N] = {
 	// SET_FREQ comes before SET_SQL in the enum above. These two were the wrong
 	// way round, so the row labelled FREQ stepped the squelch and the row
 	// labelled SQL LEVEL stepped the frequency.
-	"FREQ MHz", "SQL LEVEL", "SWEEP"
+	"FREQ MHz", "SQL LEVEL", "SWEEP", "AUD PROBE"
 };
 
 static void SetValueString(uint8_t idx, char *s)
@@ -935,6 +1006,7 @@ static void SetValueString(uint8_t idx, char *s)
 		case SET_PKTLEN:   sprintf(s, "%u B", cfg.pktlen); break;
 		case SET_SQL:      sprintf(s, "%u.%u", gEeprom.SQUELCH_LEVEL, gEeprom.SQUELCH_TENTHS); break;
 		case SET_SWEEP:    strcpy(s, onoff[sweeping]); break;
+		case SET_PROBE:    strcpy(s, onoff[probing]); break;
 		case SET_FREQ: {
 			const uint32_t f = gRxVfo->pRX->Frequency;
 			sprintf(s, "%u.%03u", (unsigned)(f / 100000u), (unsigned)((f % 100000u) / 100u));
@@ -946,8 +1018,17 @@ static void SetValueString(uint8_t idx, char *s)
 
 static void SweepApply(void)
 {
-	cfg.sync   = (uint8_t)(sweepIdx & 3u);
-	cfg.mode   = (uint8_t)((sweepIdx >> 2) & 3u);
+	// sync x baud, at mode 0. Mode is the one axis with a known-good value -
+	// 0x00C1 is exactly what BK4819_SetupAircopy uses - while baud has never
+	// been tested at all, and TONE2 setting the receive bit clock is an
+	// assumption nothing has confirmed. If the engine is looking for bits at
+	// 1200 while the air has them at 300, no sync word could ever match.
+	{
+		static const uint16_t sweepBauds[4] = { 200, 300, 600, 1200 };
+		cfg.sync = (uint8_t)(sweepIdx & 3u);
+		cfg.baud = sweepBauds[(sweepIdx >> 2) & 3u];
+	}
+	cfg.mode   = 0;
 	cfg.invert = false;   // covered by the sync word, see SWEEP_N
 	cfg.sync4  = false;   // two bytes is the permissive case
 	sweepSyncMark  = stats.syncs;
@@ -965,6 +1046,7 @@ static void SweepSetRunning(bool on)
 		sweepSaved[1] = cfg.sync;
 		sweepSaved[2] = cfg.invert ? 1u : 0u;
 		sweepSaved[3] = cfg.sync4 ? 1u : 0u;
+		sweepSavedBaud = cfg.baud;
 		sweeping = true;
 		sweepIdx = 0;
 		memset(sweepScore, 0, sizeof(sweepScore));
@@ -986,6 +1068,7 @@ static void SweepSetRunning(bool on)
 		cfg.sync   = sweepSaved[1];
 		cfg.invert = sweepSaved[2] != 0;
 		cfg.sync4  = sweepSaved[3] != 0;
+		cfg.baud   = sweepSavedBaud;
 		ModemArm();
 	}
 }
@@ -1075,6 +1158,11 @@ static void ChangeSetting(uint8_t idx, int dir)
 		}
 		case SET_SQL:      StepSquelch(dir); break;
 		case SET_SWEEP:    SweepSetRunning(!sweeping); break;
+		case SET_PROBE:
+			probing = !probing;
+			if (!probing)
+				BOARD_ADC_Init();   // battery channel back
+			break;
 		default: break;
 	}
 	if (rearm && cfg.input == INPUT_MODEM)
@@ -1223,6 +1311,7 @@ void APP_RunAlert(void)
 	memset(sweepSeen, 0, sizeof(sweepSeen));
 	burstCount = 0; sqPrev = false;
 	rssiFloor = 0; burstPeak = -127; lastPeak = -127;
+	probing = false; probePP8 = 0; probePP9 = 0;
 	lastCapLen = 0; capturing = false; capLen = 0; capAge10ms = 0;
 	tick = 0;
 
@@ -1336,8 +1425,7 @@ void APP_RunAlert(void)
 					sweepBestScore = sweepScore[sweepIdx];
 					sweepBestIdx   = sweepIdx;
 				}
-				sprintf(sb, "W %u m%u s%u i%u f%u S%u B%u\r\n", sweepIdx, cfg.mode, cfg.sync,
-				        cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u, got, saw);
+				sprintf(sb, "W %u s%u bd%u S%u B%u\r\n", sweepIdx, cfg.sync, cfg.baud, got, saw);
 				DbgSend(sb);
 				sweepIdx = (uint8_t)((sweepIdx + 1u) % SWEEP_N);
 				if (sweepIdx == 0) {
@@ -1378,6 +1466,10 @@ void APP_RunAlert(void)
 				rssiFloor = rssiDbm;
 			if ((++tick % 500) == 0 && rssiFloor < 0)
 				rssiFloor++;          // let the floor drift back up over 5 s steps
+			// Probe every 50 ms so an open squelch and a shut one are both sampled
+			// during a burst that may only last a second.
+			if (probing && (tick % 5) == 0)
+				ProbeOnce();
 			if ((tick % 10) == 0)
 				DrawStatus();
 			if ((tick % 50) == 0) {
@@ -1416,8 +1508,12 @@ void APP_RunAlert(void)
 #else
 	ModemStop();
 #endif
+	if (probing) {
+		probing = false;
+		BOARD_ADC_Init();         // the battery reading needs channel 8 back
+	}
 	if (sweeping)
-		SweepSetRunning(false);   // never store an arrangement the sweep chose
+		SweepSetRunning(false);
 	BK4819_WriteRegister(BK4819_REG_3F, 0);
 	BK4819_WriteRegister(BK4819_REG_02, 0);
 	ALERT_StoreConfig();
