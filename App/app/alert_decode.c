@@ -101,10 +101,11 @@ bool ALERT_DecodeA2C(const uint8_t b[4], AlertReading_t *out)
 }
 
 static int scan_polarity(const uint8_t *buf, uint32_t nbits, uint8_t polarity,
-                         uint8_t max_gap, AlertReading_t *out, int max_out)
+                         uint8_t max_gap, uint8_t inv, AlertReading_t *out, int max_out)
 {
 	const uint8_t idle  = (polarity == ALERT_POL_NEGATIVE) ? 0u : 1u;
 	const uint8_t start = idle ^ 1u;
+#define GB(n) (ALERT_GetBit(buf, (n)) ^ inv)
 
 	uint8_t  words[4];
 	uint32_t word_pos[4];
@@ -113,24 +114,24 @@ static int scan_polarity(const uint8_t *buf, uint32_t nbits, uint8_t polarity,
 	uint32_t pos    = 0;
 
 	while (pos + 10u <= nbits && found < max_out) {
-		if (ALERT_GetBit(buf, pos) != start) {
+		if (GB(pos) != start) {
 			pos++;
 			continue;
 		}
 		// a real start bit follows an idle bit (the previous stop bit or preamble)
-		if (pos > 0 && ALERT_GetBit(buf, pos - 1u) != idle) {
+		if (pos > 0 && GB(pos - 1u) != idle) {
 			pos++;
 			continue;
 		}
 		// candidate word: start bit at pos, stop bit at pos+9
-		if (ALERT_GetBit(buf, pos + 9u) != idle) {
+		if (GB(pos + 9u) != idle) {
 			pos++;               // framing error: slip one bit
 			nwords = 0;
 			continue;
 		}
 		uint8_t w = 0;
 		for (uint8_t i = 0; i < 8; i++)
-			w |= (uint8_t)(ALERT_GetBit(buf, pos + 1u + i) << i);   // LSB first
+			w |= (uint8_t)(GB(pos + 1u + i) << i);   // LSB first
 
 		// drop the run if this word does not follow the previous one closely
 		if (nwords && (pos - (word_pos[nwords - 1] + 10u)) > max_gap)
@@ -165,15 +166,24 @@ static int scan_polarity(const uint8_t *buf, uint32_t nbits, uint8_t polarity,
 	}
 	return found;
 }
+#undef GB
+
+int ALERT_ScanBitsEx(const uint8_t *buf, uint32_t nbits, uint8_t polarity,
+                     uint8_t max_gap, bool invert, AlertReading_t *out, int max_out)
+{
+	const uint8_t inv = invert ? 1u : 0u;
+
+	if (polarity != ALERT_POL_ANY)
+		return scan_polarity(buf, nbits, polarity, max_gap, inv, out, max_out);
+
+	int n = scan_polarity(buf, nbits, ALERT_POL_NEGATIVE, max_gap, inv, out, max_out);
+	if (n < max_out)
+		n += scan_polarity(buf, nbits, ALERT_POL_STANDARD, max_gap, inv, out + n, max_out - n);
+	return n;
+}
 
 int ALERT_ScanBits(const uint8_t *buf, uint32_t nbits, uint8_t polarity,
                    uint8_t max_gap, AlertReading_t *out, int max_out)
 {
-	if (polarity != ALERT_POL_ANY)
-		return scan_polarity(buf, nbits, polarity, max_gap, out, max_out);
-
-	int n = scan_polarity(buf, nbits, ALERT_POL_NEGATIVE, max_gap, out, max_out);
-	if (n < max_out)
-		n += scan_polarity(buf, nbits, ALERT_POL_STANDARD, max_gap, out + n, max_out - n);
-	return n;
+	return ALERT_ScanBitsEx(buf, nbits, polarity, max_gap, false, out, max_out);
 }

@@ -72,4 +72,18 @@ bool ALERT_DecodeA2C(const uint8_t b[4], AlertReading_t *out);
 int ALERT_ScanBits(const uint8_t *buf, uint32_t nbits, uint8_t polarity,
                    uint8_t max_gap, AlertReading_t *out, int max_out);
 
+// As ALERT_ScanBits, but complements every bit first when `invert` is set.
+//
+// The data sense is a separate axis from the framing polarity, and conflating
+// the two has cost this project a great deal of time. ALERT_POL_STANDARD swaps
+// which level counts as idle and start, but it still reads the eight data bits
+// as they lie, so on an inverted signal every word comes out complemented and
+// every check-bit pair and FCS fails. Confirmed by simulating the demodulator's
+// own integer arithmetic: a bitstream that decodes cleanly under NEGATIVE
+// decodes under *neither* polarity once inverted, and decodes again the moment
+// the bits are complemented. Four combinations exist - two framings times two
+// senses - and the polarity argument alone reaches only two of them.
+int ALERT_ScanBitsEx(const uint8_t *buf, uint32_t nbits, uint8_t polarity,
+                     uint8_t max_gap, bool invert, AlertReading_t *out, int max_out);
+
 #endif

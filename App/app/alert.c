@@ -147,6 +147,7 @@ static struct {
 	uint16_t gated;      // captures dropped because the squelch was closed
 	uint16_t unknown;    // frames whose address is not in the table
 	uint16_t stuck;      // captures ended by the watchdog, not by the chip
+	uint16_t inv;        // frames that only decoded with the bits complemented
 } stats;
 
 // capture buffer shared by both inputs
@@ -187,9 +188,16 @@ static uint16_t capAge10ms;      // 10 ms ticks since the sync word, for the wat
 //   invert. Inverting RX data makes the detector match the complement of the
 //   sync word, and the four sync values are closed under complement -
 //   0000<->FFFF, AAAA<->5555. Sweeping all four at invert=0 therefore covers
-//   every physical pattern invert=1 could reach. Where invert affects the
-//   captured bits rather than the sync match, ALERT_ScanBits already tries
-//   both polarities, so nothing is lost either way.
+//   every physical pattern invert=1 could reach, so far as *acquiring* a burst
+//   goes.
+//
+//   The second half of that argument used to read "and where invert affects the
+//   captured bits rather than the sync match, ALERT_ScanBits already tries both
+//   polarities, so nothing is lost either way". That was wrong, and it is why
+//   this radio spent so long reporting syncs and no frames. The two polarities
+//   swap which level is idle; neither complements the data bits, so a signal of
+//   the opposite sense frames up and then fails every check bit. ProcessCapture
+//   now tries the complemented sense explicitly, which is what closes the axis.
 //
 //   sync4. A four-byte sync word here is the same sixteen bits written to
 //   REG_5A and REG_5B, so a four-byte match is a strict subset of a two-byte
@@ -463,6 +471,14 @@ static void ModemPoll(void)
 
 #define ADC_FS 9600u
 
+// The tones on the air, as measured: V.23 mode 2 at 300 baud. Whether the mark
+// tone corresponds to a one or a zero in the framing no longer has to be got
+// right here - ProcessCapture tries both data senses - but the two frequencies
+// do, because a correlator tuned to the wrong pair loses margin it cannot get
+// back.
+#define ALERT_MARK_HZ  2100u
+#define ALERT_SPACE_HZ 1300u
+
 volatile bool gAlertAdcRun;
 
 // quarter-wave-symmetric 32-entry sine, int8
@@ -549,8 +565,16 @@ void ALERT_AdcTick(void)
 	// two quadrature correlators with a sliding window
 	const int16_t p1c = (int16_t)(x * cos256(adc.ph1)), p1s = (int16_t)(x * sin256(adc.ph1));
 	const int16_t p2c = (int16_t)(x * cos256(adc.ph2)), p2s = (int16_t)(x * sin256(adc.ph2));
-	adc.ph1 += (uint8_t)(256u * 1200u / ADC_FS);          // 32
-	adc.ph2 += (uint8_t)((256u * 2200u + ADC_FS / 2) / ADC_FS); // 59 (2212 Hz)
+	// ALERT is V.23-style AFSK, not Bell 202: mark 2100 Hz, space 1300 Hz at
+	// 300 baud, measured off air rather than inferred. At 9600 Hz the increment
+	// for 2100 Hz is exact (56/256 of a cycle) and 1300 Hz lands 12.5 Hz high.
+	// The old 1200/2200 pair did still separate these two tones - they fall on
+	// opposite sides of its decision boundary - but it separated them with the
+	// sense reversed and with far less margin. Simulating this exact integer
+	// code over 40 bursts per point: at 0.3 noise, 19/40 decoded with the old
+	// constants against 38/40 with these; at 0.4, 9/40 against 35/40.
+	adc.ph1 += (uint8_t)((256u * ALERT_MARK_HZ  + ADC_FS / 2) / ADC_FS);  // 56 = 2100.0 Hz
+	adc.ph2 += (uint8_t)((256u * ALERT_SPACE_HZ + ADC_FS / 2) / ADC_FS);  // 35 = 1312.5 Hz
 
 	adc.s1c += p1c - adc.h1c[adc.hi]; adc.h1c[adc.hi] = p1c;
 	adc.s1s += p1s - adc.h1s[adc.hi]; adc.h1s[adc.hi] = p1s;
@@ -559,7 +583,7 @@ void ALERT_AdcTick(void)
 	if (++adc.hi >= CORR_W) adc.hi = 0;
 
 	const int32_t a1 = adc.s1c >> 6, b1 = adc.s1s >> 6, a2 = adc.s2c >> 6, b2 = adc.s2s >> 6;
-	const uint8_t bit = ((a1 * a1 + b1 * b1) > (a2 * a2 + b2 * b2)) ? 1u : 0u;   // 1200 Hz = 1
+	const uint8_t bit = ((a1 * a1 + b1 * b1) > (a2 * a2 + b2 * b2)) ? 1u : 0u;   // mark = 1
 
 	// bit clock recovery: pull the phase towards the transitions
 	if (bit != adc.lastBit) {
@@ -750,7 +774,20 @@ static void ProcessCapture(const uint8_t *buf, uint32_t nbits, bool gated, int16
 		return;
 	}
 
-	const int n = ALERT_ScanBits(buf, nbits, cfg.polarity, 20, r, 8);
+	int n = ALERT_ScanBits(buf, nbits, cfg.polarity, 20, r, 8);
+	if (n <= 0) {
+		// Then the complemented sense. This is the fourth of four combinations -
+		// two framings times two data senses - and until now nothing reached it.
+		// The sweep pinned invert=0 arguing that the four sync values are closed
+		// under complement, which is true of *acquiring* a burst and false of
+		// decoding one: the sync word decides whether the engine latches on, the
+		// data sense decides whether the words survive their check bits. A signal
+		// of the opposite sense therefore syncs and never decodes, which is
+		// exactly the S>0 F=0 this radio has reported from the first flash.
+		n = ALERT_ScanBitsEx(buf, nbits, cfg.polarity, 20, true, r, 8);
+		if (n > 0)
+			stats.inv++;
+	}
 	if (n <= 0) {
 		redraw = true;
 		return;
@@ -922,9 +959,9 @@ static void DrawMain(void)
 			// the winning arrangement, left on the glass so it can be read back
 			// hours later without anyone having captured the serial stream
 			{
-				static const uint16_t bestBauds[4] = { 200, 300, 600, 1200 };
-				sprintf(s, "BEST S%u %uBD =%u/%u", (unsigned)(sweepBestIdx & 3u),
-				        bestBauds[(sweepBestIdx >> 2) & 3u],
+				static const char *const bestModes[4] = { "1218", "1224", "SAME", "DIR" };
+				sprintf(s, "BEST S%u %s =%u/%u", (unsigned)(sweepBestIdx & 3u),
+				        bestModes[(sweepBestIdx >> 2) & 3u],
 				        sweepBestScore, sweepSeen[sweepBestIdx]);
 			}
 			UI_PrintStringSmallNormal(s, 0, 0, 4);
@@ -1018,18 +1055,20 @@ static void SetValueString(uint8_t idx, char *s)
 
 static void SweepApply(void)
 {
-	// sync x baud, at mode 0. Mode is the one axis with a known-good value -
-	// 0x00C1 is exactly what BK4819_SetupAircopy uses - while baud has never
-	// been tested at all, and TONE2 setting the receive bit clock is an
-	// assumption nothing has confirmed. If the engine is looking for bits at
-	// 1200 while the air has them at 300, no sync word could ever match.
+	// sync x mode, at the known baud. The rate is no longer in question: the air
+	// has been measured at 300 baud, mark 2100 Hz, space 1300 Hz, so spending
+	// transmissions on a baud sweep buys nothing. Mode is the axis that has never
+	// been tried at anything but 0, and it is the one that selects the chip's
+	// tone pair. Of the four, SAME (1562/2083 Hz) puts its mark within 17 Hz of
+	// the real 2100 and is a non-coherent AFSK detector rather than the MSK-style
+	// detector FFSK 1200/1800 is, where tone and bit rate are locked together and
+	// neither matches this signal.
 	{
-		static const uint16_t sweepBauds[4] = { 200, 300, 600, 1200 };
 		cfg.sync = (uint8_t)(sweepIdx & 3u);
-		cfg.baud = sweepBauds[(sweepIdx >> 2) & 3u];
+		cfg.mode = (uint8_t)((sweepIdx >> 2) & 3u);
+		cfg.baud = 300;
 	}
-	cfg.mode   = 0;
-	cfg.invert = false;   // covered by the sync word, see SWEEP_N
+	cfg.invert = false;   // the data sense is handled in software, see ProcessCapture
 	cfg.sync4  = false;   // two bytes is the permissive case
 	sweepSyncMark  = stats.syncs;
 	sweepBurstMark = burstCount;
@@ -1486,11 +1525,11 @@ void APP_RunAlert(void)
 					// capture cannot be attributed to the settings that produced it,
 					// which made the first set of dumps much less useful than it
 					// should have been.
-					sprintf(hb, "D I%u S%u F%u G%u X%u B%u R%d Q%u N%u m%u y%u v%u l%u f%d p%d\r\n",
+					sprintf(hb, "D I%u S%u F%u G%u X%u B%u R%d Q%u N%u m%u y%u v%u l%u f%d p%d V%u\r\n",
 					        dbgIrqCount, stats.syncs, stats.frames, stats.gated,
 					        stats.stuck, lastCapLen, rssiDbm, sqOpen ? 1u : 0u, burstCount,
 					        cfg.mode, cfg.sync, cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u,
-					        rssiFloor, lastPeak);
+					        rssiFloor, lastPeak, stats.inv);
 					DbgSend(hb);
 				}
 			}

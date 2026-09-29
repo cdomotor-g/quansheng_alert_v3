@@ -19,7 +19,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import alertmon as m
 
 RATE = 22050
-MARK, SPACE = 1200.0, 2200.0
+# Measured off air, not assumed: V.23 mode 2 tones at 300 baud. The Bell-202
+# 1200/2200 this file used to generate made every check of the decode chain a
+# check against the wrong signal.
+MARK, SPACE = 2100.0, 1300.0
 BAUD = 300.0
 
 

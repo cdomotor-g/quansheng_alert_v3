@@ -1,8 +1,10 @@
 /* ALERT telemetry receiver app for the Quansheng UV-K5 (DP32G030 + BK4819).
  *
- * Receives legacy ALERT (ERTS) flood-warning telemetry - 300 baud Bell-202
- * AFSK, four 10-bit async words carrying a 13-bit station address and an
- * 11-bit value - decodes it, looks the address up in the MegaNet-derived
+ * Receives legacy ALERT (ERTS) flood-warning telemetry - 300 baud AFSK, mark
+ * 2100 Hz and space 1300 Hz (V.23 mode 2 tones, measured off air; this file
+ * used to say Bell-202 1200/2200, which was never checked), four 10-bit async
+ * words carrying a 13-bit station address and an 11-bit value - decodes it,
+ * looks the address up in the MegaNet-derived
  * station table, shows it on the LCD and optionally reads it out with the
  * radio's voice prompts.
  *
@@ -15,7 +17,7 @@
  *          then framed in software (app/alert_decode.c). No hardware change.
  *
  *   ADC    (ENABLE_ALERT_ADC) The discriminator audio is sampled by the MCU's
- *          SAR ADC at 9600 Hz and demodulated in software (1200/2200 Hz tone
+ *          SAR ADC at 9600 Hz and demodulated in software (2100/1300 Hz tone
  *          correlators + bit clock recovery). Needs a one-wire hardware mod:
  *          BK4819 pin 8 (EARO) -> 100 nF -> DP32G030 pin 9 (PA8 / ADC CH3).
  *          See README.md.

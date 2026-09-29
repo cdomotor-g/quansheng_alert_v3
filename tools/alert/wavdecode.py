@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Work out what an ALERT burst actually is, from a recording of the audio.
 
-Everything tried so far has assumed the signal: 300 baud, 1200/2200 Hz, a
-particular framing. None of that has been measured, and the radio is a poor
+The signal is now known: 300 baud, mark 2100 Hz, space 1300 Hz (V.23 mode 2).
+What a recording still settles is whether a given station matches that, and the
+radio is a poor
 instrument for measuring it - the BK4819's FSK engine produces bits on this
 waveform that are statistically indistinguishable from noise, so it cannot tell
 us whether our assumptions are wrong or merely unlucky.
@@ -17,7 +18,7 @@ since the tones survive lossy recording - and it reports:
     the firmware uses (tools/alert/alertmon.py), in both polarities
 
     python tools/alert/wavdecode.py burst.wav
-    python tools/alert/wavdecode.py burst.wav --mark 1200 --space 2200 --baud 300
+    python tools/alert/wavdecode.py burst.wav --mark 2100 --space 1300 --baud 300
 
 Check it against a known answer first - a tool that has only ever been run on
 unknown data cannot be trusted when it says "no ALERT frame":
@@ -185,7 +186,7 @@ def main():
         mark, space = peaks[0][1], peaks[1][1]
         print('')
         print('two strongest tones: %g and %g Hz' % (mark, space))
-        print('  (1200/2200 is what the firmware decoder assumes)')
+        print('  (2100/1300 at 300 baud is what the air has been measured at)')
     else:
         print('')
         print('only one tone stands out - this may not be two-tone FSK at all')
