@@ -232,6 +232,62 @@ The candidates it will cover, and what each would mean:
 If one of those acquires during bursts, there will be real bits to decode, and
 the inversion fix already committed means the sense no longer has to be guessed.
 
+## The sweep confirmed it, and SQ GATE is what proved it
+
+Eight arrangements, one qualifying burst each, with SQ GATE on:
+
+| idx | SYNC | baud | syncs | bursts |
+|---|---|---|---|---|
+| 2 | 0xAAAA | 200 | 0 | 1 |
+| 3 | 0x5555 | 200 | 0 | 1 |
+| 4 | 0x0000 | 300 | 0 | 1 |
+| 5 | **0xFFFF** | **300** | **1** | 1 |
+| 6 | 0xAAAA | 300 | 0 | 1 |
+| 7 | 0x5555 | 300 | 0 | 1 |
+| 8 | 0x0000 | 600 | 0 | 1 |
+| 9 | 0xFFFF | 600 | 0 | 1 |
+
+Arrangement 5 looks like an acquisition until you read the capture it produced:
+
+```
+A 448 0 -87    <- gated 0, RSSI -87 dBm
+```
+
+Squelch shut, at the noise floor, while bursts peak at −14 dBm. Another noise
+sync that happened to land inside that arrangement's window. `G` incremented to
+1, so SQ GATE correctly rejected it, which is exactly the instrumentation that
+was missing before.
+
+**No sync word acquires during a burst.** Not `0000`, not `FFFF`, not `AAAA`,
+not `5555`. Syncs arrive at roughly one per eight bursts' worth of elapsed time
+and are uncorrelated with the signal, because they are noise.
+
+The `F1` that appeared earlier is not evidence either. The firmware's own
+single-path scan decodes something from **2.70%** of random 448-bit captures,
+measured over 4000 of them, so across the dozen captures this session one
+spurious frame has a 28% chance of turning up. A decode worth believing names a
+real station: only 379 of the 8192 possible addresses are in the table, so a
+chance decode lands on a named station just 0.12% of the time.
+
+## The fix, committed and needing a flash
+
+Capture on the **squelch edges** instead of on a sync word. `AdcPoll` has worked
+this way since the port — open squelch starts collecting, closed squelch ends
+it, no sync word anywhere — and the modem path should have been written the same
+way from the start.
+
+The engine never needed the sync word to make bits. Once triggered it free-runs
+and fills 56 bytes in the 1.5 s before the watchdog stops it. The only thing
+missing was draining the FIFO while the signal was actually present, and the
+squelch already knows when that is.
+
+Why the sync word never matched is inference rather than measurement: `REG_59`
+asks for a six-byte preamble and the BK4819's preamble detector wants something
+alternating, which a burst opening on a steady tone does not provide.
+
+`C` in the heartbeat counts squelch-started captures, kept separate from `S` so
+the two triggers stay distinguishable.
+
 ## If the engine still will not do it
 
 The BK4819's FSK modes are fixed tone pairs and none of them is 1300/2100 at
