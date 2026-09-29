@@ -115,6 +115,56 @@ sits 17 Hz from the real 2100 Hz, and it is a non-coherent AFSK detector, where
 FFSK 1200/1800 locks tone to bit rate and matches neither. Mode has never been
 set to anything but 0.
 
+## Result: SAME mode does not acquire (tested 2026-09-29)
+
+MDM MODE set to SAME, MONITOR on, over 2.2 minutes:
+
+| | |
+|---|---|
+| Bursts counted | 7 |
+| RSSI range | −87 to **−19 dBm** |
+| Strongest peak | −15 dBm |
+| Sync words found | **0** |
+| Captures | **0** |
+
+Signal is unambiguously arriving and the squelch opens for it. The SAME-mode
+FSK engine never raises `FSK_RX_SYNC`, not once. Mode 0 at least tripped sync
+occasionally, on noise; SAME trips it never.
+
+That is worse than a negative result, because **a capture only begins on a sync
+interrupt**, so SAME yields no bits at all to examine. The tone question cannot
+be answered from behind a sync detector that will not fire.
+
+## A flaw in the earlier capture analysis
+
+A burst lasts at most ~500 ms. `cfg.pktlen` defaults to 32 bytes, and at 300
+baud the chip will not raise `RX_FINISHED` until 256 bits have arrived, which is
+853 ms. So the watchdog ends every capture at 1.5 s, and roughly the last 350
+bits of each 448-bit capture are the engine free-running on noise *after* the
+signal stopped. Judging the whole capture dilutes whatever the opening holds.
+
+Re-examined windowed, the two captures disagree: cap1 opens at 0.590
+transitions per bit and cap2 at 0.385, one above chance and one below, both
+inside about 1.4 standard errors of 0.5. **Two captures cannot settle it.**
+
+Fix the setting before gathering more: **CAPTURE to 16 bytes** (427 ms at 300
+baud) so a capture is mostly burst. `capture_stats.py` now prints the windowed
+view and the standard error, so a single suggestive window cannot be mistaken
+for evidence.
+
+## The decisive test still outstanding
+
+**MDM MODE back to FFSK1218, MONITOR left on, CAPTURE 16.**
+
+Mode 0 is the only mode that demonstrably trips sync, so it is the only one that
+yields bits. With MONITOR on, the AF selector is at FM instead of MUTE, which is
+the one variable that differs from the captures that came out as noise. Same
+mode, same sync word, unmuted AF, undiluted window. If the transition density
+drops away from 0.5 across several captures, the mute was the problem.
+
+If it does not, try **SYNC = FFFF** on SAME. If the engine's output sits stuck
+high, that will trip immediately and finally hand over some bits to look at.
+
 ## If the engine still will not do it
 
 The BK4819's FSK modes are fixed tone pairs and none of them is 1300/2100 at

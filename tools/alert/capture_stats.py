@@ -181,6 +181,34 @@ def main(argv):
     print("at 0.5 with a geometric run histogram. Judge by that, not by eye.")
     print()
 
+    print("=== windowed: only the start of a capture holds the burst ===")
+    print("A burst lasts at most ~500 ms. The chip waits for cfg.pktlen bytes")
+    print("before raising RX_FINISHED - 32 bytes is 853 ms at 300 baud - so the")
+    print("watchdog ends the capture at 1.5 s and the tail is the engine")
+    print("free-running on noise after the signal stopped. Judging the whole")
+    print("capture dilutes whatever signal the opening holds. Set CAPTURE to 16")
+    print("bytes or less so a capture is mostly burst.")
+    print()
+    print("at 300 baud: 133 ms = 40 bits, 350 ms = 105, 500 ms = 150")
+    print()
+    print("%-7s %-11s %6s %10s %7s" % ("", "window", "bits", "trans/bit", "maxrun"))
+    for name, nbits, rssi, hx in caps:
+        b = bits_of(hx, nbits)
+        for lo, hi, lbl in ((0, 40, "first 40"), (0, 64, "first 64"),
+                            (0, 105, "first 105"), (0, 150, "first 150"),
+                            (150, None, "after 150"), (0, None, "all")):
+            w = b[lo:hi] if hi else b[lo:]
+            if len(w) < 8:
+                continue
+            _, _, tr, mx = stats_line(w)
+            print("%-7s %-11s %6d %10.3f %7d" % (name, lbl, len(w), tr, mx))
+        print()
+    print("Signal reads LOW here (~0.22), noise ~0.50. On a 40-bit window the")
+    print("standard error is about 0.08, so anything inside 0.42-0.58 is chance.")
+    print("Several captures agreeing in the same direction is the evidence; one")
+    print("window on one capture is not.")
+    print()
+
     print("=== run-length histogram ===")
     for name, nbits, rssi, hx in caps:
         r = runs(bits_of(hx, nbits))
