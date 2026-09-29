@@ -99,9 +99,10 @@ settings downstream could never have shown a difference.
 Fixed here: AF stays at FM, and `AUDIO_AudioPathOff()` alone decides whether
 the speaker is live.
 
-**Testable on the radio as it stands, no reflash:** MONITOR on (`F` then `#`
-inside the app) is the old code's only route to AF = FM. Capture the USB stream
-and compare.
+**Testable on the radio as it stands, no reflash:** MONITOR on is the old
+code's only route to AF = FM. There is no `#` key on this radio's keypad, so use
+the app's MENU and the MONITOR row, not the keyboard shortcut the notes above
+once gave. Capture the USB stream and compare.
 
 ```bash
 python tools/alert/capture_stats.py com5.log
