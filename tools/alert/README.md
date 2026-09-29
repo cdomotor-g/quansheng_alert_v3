@@ -166,6 +166,72 @@ drops away from 0.5 across several captures, the mute was the problem.
 If it does not, try **SYNC = FFFF** on SAME. If the engine's output sits stuck
 high, that will trip immediately and finally hand over some bits to look at.
 
+## Correction: every capture so far was recorded during silence
+
+This invalidates the "the engine emits noise" conclusion above, and it is the
+most useful thing found so far. The `A` capture line's second field is `gated`,
+meaning the squelch was open during the capture. Across every capture ever
+taken, in both configurations:
+
+| Capture | gated | RSSI | floor at the time |
+|---|---|---|---|
+| earlier run, AF muted | 0 | −70 dBm | ~−74 dBm |
+| earlier run, AF muted | 0 | −72 dBm | ~−74 dBm |
+| mode 0, AF at FM | 0 | −84 dBm | −98 dBm |
+| mode 0, AF at FM | 0 | −83 dBm | −98 dBm |
+
+Bursts peak at **−14 dBm**. Every capture sat at the noise floor with the
+squelch shut. **No capture has ever coincided with a burst.** The statistics
+were measuring the receiver's own silence, which is of course noise, and they
+were never a test of what the engine does with a signal.
+
+`SQ GATE` defaults **off**, which is why these were accepted rather than
+discarded.
+
+### What that means
+
+The sync detector is not failing to slice the burst. It is not firing during
+the burst at all. It fires occasionally on noise between bursts, because random
+bits throw up sixteen zeros now and then, and `SYNC` is set to `0000`.
+
+Everything fits: syncs happen but rarely, never during a burst, and every
+resulting capture is noise. The default `SYNC_0000` was chosen on the reasoning
+that an idle preamble under negative logic reads as zeros. That assumed the
+sense, and the sense is exactly what has never been established.
+
+### Also settled: unmuting the AF changed nothing
+
+Mode 0 with MONITOR on, opening window pooled over 298 adjacent pairs, gives
+0.5034 with a one-sided p of 0.57 against the AF-muted set's 0.5201. Difference
+z = 0.41, not significant. The AF-mute theory is dead. Both sets are silence, so
+this was never going to show anything, but it is ruled out either way.
+
+## The test that follows from it
+
+Two menu changes, and the radio does the rest:
+
+1. **SQ GATE = ON.** Captures recorded with the squelch shut are then rejected
+   and counted in `G`, so `S` rising with a capture at a strong RSSI means a
+   real burst was acquired. Pure instrumentation, and it stops the analysis
+   being poisoned by silence.
+2. **SWEEP = ON.** The sweep in the shipped build walks sync × baud and reports
+   each arrangement over USB as `W <idx> s<sync> bd<baud> S<syncs> B<bursts>`,
+   which is exactly "which sync word acquires, judged on this many real
+   bursts". It covers all four sync values at 300 baud among its sixteen
+   arrangements and paces itself to the signal, so it needs no further
+   keypresses.
+
+The candidates it will cover, and what each would mean:
+
+| `SYNC` | Fires if the sliced preamble is |
+|---|---|
+| `0000` | a steady tone read as zeros (tried, never fires on a burst) |
+| `FFFF` | a steady tone read as ones, i.e. the opposite sense |
+| `AAAA` / `5555` | an alternating pattern, as modems send for clock recovery |
+
+If one of those acquires during bursts, there will be real bits to decode, and
+the inversion fix already committed means the sense no longer has to be guessed.
+
 ## If the engine still will not do it
 
 The BK4819's FSK modes are fixed tone pairs and none of them is 1300/2100 at
