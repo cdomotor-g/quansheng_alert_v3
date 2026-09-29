@@ -13,7 +13,7 @@
 >
 > | Your radio | Repository |
 > |---|---|
-> | UV-K5, UV-K5(8), UV-K6, UV-5R Plus — **DP32G030**, bootloader `2.x` | [cdomotor-g/quansheng_alert](https://github.com/cdomotor-g/quansheng_alert) |
+> | UV-K5, UV-K5(8), UV-K6, UV-5R Plus — **DP32G030**, bootloader `2.x` | [cdomotor-g/quansheng_alert](https://github.com/cdomotor-g/quansheng_alert) — *archived, but still the correct and flashable source for these radios* |
 > | UV-K5 **V3**, UV-K1 — **PY32F071**, bootloader `7.x` | **this repository** |
 >
 > Take the battery off and read the label: a **V3** says `V3` beside the barcode
