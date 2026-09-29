@@ -361,7 +361,21 @@ static void ModemArm(void)
 
 	// BK4819_RX_TurnOn re-enables the AF DAC, so put the audio path back where
 	// the settings say it should be rather than wherever the reset left it.
-	BK4819_SetAF(cfg.monitor ? BK4819_AF_FM : BK4819_AF_MUTE);
+	//
+	// AF stays at FM whether or not anyone is listening. This used to follow
+	// cfg.monitor, which defaults off, so the AF selector sat at MUTE for the
+	// whole time the modem was armed - and MUTE is a plausible way to starve the
+	// FSK engine of the very signal it is meant to slice. Note what the one FSK
+	// path in this fork that demonstrably works does: BK4819_PrepareFSKReceive
+	// never touches REG_47 at all, so aircopy runs with AF left at FM.
+	//
+	// Audibility is a separate thing from whether the chip demodulates, and it
+	// has its own control: AUDIO_AudioPathOff() gates the external audio, so the
+	// speaker stays silent with the demodulator still running. Whether MUTE was
+	// actually starving the engine is not proven here - it is cheap to remove as
+	// a possibility, and it costs only a little DAC current.
+	BK4819_SetAF(BK4819_AF_FM);
+	if (cfg.monitor) AUDIO_AudioPathOn(); else AUDIO_AudioPathOff();
 
 	capturing  = false;
 	capLen     = 0;
@@ -1121,8 +1135,8 @@ static void ApplySquelch(void)
 		gRxVfo->SquelchCloseGlitchThresh, gRxVfo->SquelchOpenGlitchThresh);
 	// BK4819_SetupSquelch zeroes REG_70 (our bit clock) and mutes AF
 	if (cfg.input == INPUT_MODEM)
-		ModemArm();
-	if (cfg.monitor)
+		ModemArm();          // which puts AF back to FM and sets the audio path
+	else
 		BK4819_SetAF(BK4819_AF_FM);
 }
 
@@ -1152,8 +1166,9 @@ static void ChangeSetting(uint8_t idx, int dir)
 		case SET_UNKNOWN:  cfg.show_unknown = !cfg.show_unknown; break;
 		case SET_CONFIRM:  cfg.confirm = !cfg.confirm; break;
 		case SET_MONITOR:
+			// only the audio path moves: the AF selector stays at FM so the FSK
+			// engine keeps its signal whether or not the speaker is live
 			cfg.monitor = !cfg.monitor;
-			BK4819_SetAF(cfg.monitor ? BK4819_AF_FM : BK4819_AF_MUTE);
 			if (cfg.monitor) AUDIO_AudioPathOn(); else AUDIO_AudioPathOff();
 			break;
 		case SET_MODE:     cfg.mode = (uint8_t)((cfg.mode + MODE_N + dir) % MODE_N); rearm = true; break;
@@ -1374,10 +1389,8 @@ void APP_RunAlert(void)
 #else
 	ModemArm();
 #endif
-	if (cfg.monitor) {
-		BK4819_SetAF(BK4819_AF_FM);
-		AUDIO_AudioPathOn();
-	}
+	if (cfg.monitor)
+		AUDIO_AudioPathOn();   // ModemArm/AdcStart already left AF at FM
 
 	while (running) {
 		// keys (edge triggered)
@@ -1418,8 +1431,8 @@ void APP_RunAlert(void)
 			if (gVoiceReadIndex == 0 && gVoiceWriteIndex == 0) {
 				// finished: voice playback muted the AF and may have touched the AF path
 				voiceBusy = false;
-				if (cfg.monitor) { BK4819_SetAF(BK4819_AF_FM); AUDIO_AudioPathOn(); }
-				else             { BK4819_SetAF(BK4819_AF_MUTE); AUDIO_AudioPathOff(); }
+				BK4819_SetAF(BK4819_AF_FM);   // the engine needs it back regardless
+				if (cfg.monitor) AUDIO_AudioPathOn(); else AUDIO_AudioPathOff();
 			}
 		}
 #endif
