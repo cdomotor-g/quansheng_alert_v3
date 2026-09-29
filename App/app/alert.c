@@ -148,6 +148,7 @@ static struct {
 	uint16_t unknown;    // frames whose address is not in the table
 	uint16_t stuck;      // captures ended by the watchdog, not by the chip
 	uint16_t inv;        // frames that only decoded with the bits complemented
+	uint16_t sqcap;      // captures started by the squelch rather than by a sync word
 } stats;
 
 // capture buffer shared by both inputs
@@ -439,6 +440,41 @@ static void ModemPoll(void)
 			lastPeak = burstPeak;
 		}
 	}
+
+	// Capture on the squelch edges, not on the FSK sync word.
+	//
+	// The sync detector has never once fired during a burst. Every capture this
+	// radio has ever produced was triggered between bursts, at the noise floor
+	// with the squelch shut - four of them, at -70, -72, -84 and -83 dBm against
+	// floors of -74 and -98, while bursts peak at -14. Random bits throw up
+	// sixteen zeros often enough to trip SYNC_0000 now and then, and that is all
+	// those captures ever were. So every statistic taken off them described the
+	// receiver's own silence, and no setting downstream of the sync detector
+	// could have changed that.
+	//
+	// The engine does not need the sync word in order to produce bits: once
+	// triggered it free-runs and fills 56 bytes in the 1.5 s before the watchdog
+	// stops it. All that was ever missing was draining the FIFO at the right
+	// moment, and the squelch knows when that is.
+	//
+	// AdcPoll has worked this way since the port - open squelch starts
+	// collecting, closed squelch ends it, no sync word anywhere - and the modem
+	// path should have been doing the same. A burst preceded by a steady tone
+	// gives the BK4819's preamble detector nothing alternating to lock onto,
+	// which is the likeliest reason the sync word never matched.
+	if (sqOpen && !sqPrev) {
+		ModemReArm();              // drop whatever noise is already in the FIFO
+		capturing  = true;
+		capLen     = 0;
+		capGate    = true;         // by construction: the squelch is open
+		capRssi    = rssiDbm;
+		capAge10ms = 0;
+		stats.sqcap++;
+		redraw     = true;
+	} else if (!sqOpen && sqPrev && capturing) {
+		FinishCapture();           // the burst is over, hand the bits to the decoder
+	}
+
 	sqPrev = sqOpen;
 	if (capturing && sqOpen)
 		capGate = true;
@@ -1533,16 +1569,19 @@ void APP_RunAlert(void)
 				ST7565_FixInterfGlitch();
 				redraw = true;
 				{
-					char hb[112];
+					// 128, not 112: the longest this line can render is 108 bytes with
+					// every counter saturated, and a sprintf overrun into the stack is a
+					// fault this app has already been debugged for once.
+					char hb[128];
 					// The arrangement goes out with every heartbeat. Without it a
 					// capture cannot be attributed to the settings that produced it,
 					// which made the first set of dumps much less useful than it
 					// should have been.
-					sprintf(hb, "D I%u S%u F%u G%u X%u B%u R%d Q%u N%u m%u y%u v%u l%u f%d p%d V%u\r\n",
+					sprintf(hb, "D I%u S%u F%u G%u X%u B%u R%d Q%u N%u m%u y%u v%u l%u f%d p%d V%u C%u\r\n",
 					        dbgIrqCount, stats.syncs, stats.frames, stats.gated,
 					        stats.stuck, lastCapLen, rssiDbm, sqOpen ? 1u : 0u, burstCount,
 					        cfg.mode, cfg.sync, cfg.invert ? 1u : 0u, cfg.sync4 ? 1u : 0u,
-					        rssiFloor, lastPeak, stats.inv);
+					        rssiFloor, lastPeak, stats.inv, stats.sqcap);
 					DbgSend(hb);
 				}
 			}
