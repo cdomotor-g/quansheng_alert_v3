@@ -4,6 +4,52 @@ Written 2026-09-29, from a session with the radio on the bench and both serial
 ports live. It exists because the earlier chat logs were lost and the same
 ground was being covered twice.
 
+## Working, 2026-09-30: 22 bursts of 22 decoded, no hardware change
+
+The receiver's demodulated audio is already on **PA4**, readable by the MCU's
+ADC with the DAC holding a mid-rail bias (`AUD pin=PA4B pa=0`). The PB1 probe
+that said "no audio" ran with the AF muted. The X1 build finds this by itself
+at app entry and runs the software AFSK demodulator (`App/app/alert_adc.c`) on
+every burst.
+
+| Build | Bursts decoded | Named stations |
+|---|---|---|
+| everything before X1 (BK4819 FSK engine) | 0 | 0 |
+| X1 `cee0699`, PA4 route | 3 of 3, then switched itself off | 0 (table was Mt Kanigan) |
+| `340608b` (confirmation, gate and table fixes) | 11 of 18 (61%) | 9 |
+| `8a9b2ec` (mid-bit sampling) | **22 of 22** | **21** |
+
+Heard on 151.500 MHz: Tallai, Beachmere, Loamside, Kilmoylar Rd, Ipswich, Vennor
+Drive, Alice Gap, Sheep Station, Logan Village, John Bray Park, Dayboro, Waller
+Rd, Brassall, Bellbird Park, Wongawallan, Willow Vale, Rothwell.
+
+What had to change after the first on-air run, in order:
+1. The burst confirmation wanted the tones 10 dB over the idle hiss; they sit
+   ~6 dB over it, so it turned the working route off. A decode now confirms it.
+2. The idle gate dropped frames that follow 40 bits of something that does not
+   frame (Bundamba 2044). Strictly back-to-back frames may now start up to 48
+   bits behind an idle run; the chance rate on noise is unchanged.
+3. The station table covered Central Queensland; the radio hears South East
+   Queensland. `filters/stations.filter` is now Constitution Hill + Mt Glorious.
+4. **The demodulator took every bit on its boundary.** The bit clock locks
+   phase 0 to the transitions and the bit was taken at phase 0. Taking it at
+   phase 16 is the whole difference between 61% and 100%.
+
+The BK4819 FSK engine never once synced during a burst in any of the 23 X1
+arrangements (`bs=0` across the board). It is not needed.
+
+### Flashing is hands-off now
+
+After the one PTT-at-power-on flash of X1, every later build goes on over USB-C:
+
+```bash
+python tools/hotflash.py --run <CI run id> --expect-hash <short sha>
+```
+
+It checks the on-radio bootloader (CRC 22CDCECB, 7.00.07), jumps the running
+app into the stock bootloader's own DFU, flashes with serialtool, and confirms
+the new build's hash. Verified three times on this radio.
+
 ## The signal, settled
 
 Measured off air by the operator, not inferred from a datasheet:
