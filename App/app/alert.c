@@ -37,6 +37,7 @@
 #include "radio.h"
 #include "scheduler.h"
 #include "settings.h"
+#include "ui/ui.h"
 #ifdef ENABLE_UART
 	#include "driver/uart.h"
 #endif
