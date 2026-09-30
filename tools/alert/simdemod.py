@@ -119,6 +119,7 @@ def demod(samples, inc1, inc2, corr_w, spb):
     for raw in samples:
         dc_x16 += ((raw << 4) - dc_x16) >> 7
         x = (raw - (dc_x16 >> 4)) >> 3
+        x = max(-256, min(255, x))      # alert_adc.c DemodSample: keeps the int16 products whole
 
         p1c = s16(x * cos256(ph1))
         p1s = s16(x * sin256(ph1))

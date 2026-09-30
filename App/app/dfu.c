@@ -28,7 +28,9 @@
 #include <string.h>
 
 #include "py32f0xx.h"                 // RCC / SCB / SysTick / NVIC / core intrinsics
+#include "driver/bk4819.h"
 #include "external/printf/printf.h"   // sprintf
+#include "functions.h"                // gCurrentFunction
 
 #if defined(ENABLE_USB)
     #include "driver/vcp.h"
@@ -305,11 +307,45 @@ void DFU_EmitBootLine(void)
 }
 
 // ---------------------------------------------------------------------------
+// Software resets that leave the transmitter off
+//
+// The BK4829 keeps its TX state across an MCU reset: the PA enable is its own
+// GPIO1 (REG_33) and TX is enabled in REG_30, and the stock bootloader never
+// writes the chip. A normal boot re-runs BK4819_Init within ~200 ms, but DFU -
+// ours, or the bootloader's own PTT-DFU when the reset lands with PTT still
+// held - never does, and would leave a carrier on that only a power-off stops.
+// So every software reset from here takes the transmitter down first, the same
+// way RADIO_SetupRegisters() does, and then idles the chip.
+
+bool DFU_Transmitting(void)
+{
+    return gCurrentFunction == FUNCTION_TRANSMIT;
+}
+
+static void dfu_tx_off(void)
+{
+    BK4819_ToggleGpioOut(BK4819_GPIO5_PIN1_RED, false);
+    BK4819_SetupPowerAmplifier(0, 0);
+    BK4819_ToggleGpioOut(BK4819_GPIO1_PIN29_PA_ENABLE, false);
+    BK4819_Idle();
+}
+
+void DFU_SafeReset(void)
+{
+    dfu_tx_off();
+    __DSB();
+    NVIC_SystemReset();
+    for (;;) { }   // keeps the noreturn promise whatever the CMSIS header says
+}
+
+// ---------------------------------------------------------------------------
 // DFU request / auto-heal
 
 bool DFU_RequestDfu(void)
 {
-    if (!DFU_BootloaderOk())
+    // Refused, not deferred: the callers retry (AlertBootTask) or report it
+    // (0x05E0), and a DFU entry is never worth cutting a transmission for.
+    if (DFU_Transmitting() || !DFU_BootloaderOk())
         return false;
 
     // A DFU entry means someone is about to flash a fix; let the new build start
@@ -319,9 +355,8 @@ bool DFU_RequestDfu(void)
     g_ni.sig_inv        = ~NOINIT_SIG;
     g_ni.dfu_magic      = DFU_MAGIC;
     g_ni.dfu_magic_inv  = ~DFU_MAGIC;
-    __DSB();
-    NVIC_SystemReset();
-    return true;   // not reached
+    DFU_SafeReset();    // backstop: nothing may be left keyed going into DFU
+    return true;        // not reached
 }
 
 bool DFU_AutostartBlocked(void) { return DFU_AbnormalCount() >= 3; }
@@ -333,6 +368,7 @@ bool DFU_AutoDfuDue(void)       { return DFU_AbnormalCount() >= 5; }
 static volatile uint16_t s_uptime_10ms;
 static volatile uint16_t s_wd_10ms;
 static volatile bool     s_wd_armed;
+static bool              s_app_entered;   // APP_RunAlert has run since this boot
 
 static void dfu_record_reason_and_reset(uint8_t reason)
 {
@@ -355,6 +391,16 @@ void DFU_WatchdogArm(bool on)
 {
     s_wd_armed = on;
     s_wd_10ms  = 0;
+    // Arming happens exactly at APP_RunAlert entry, whichever path started it
+    // (menu, key action, SWEEP_CTL op 7, autostart), so it doubles as the
+    // "the app already ran this boot" mark the autostart needs.
+    if (on)
+        s_app_entered = true;
+}
+
+bool DFU_AppEntered(void)
+{
+    return s_app_entered;
 }
 
 void DFU_WatchdogKick(void)
@@ -413,6 +459,11 @@ void DFU_HostEnter(const uint8_t *payload, uint16_t len)
     }
     if (!DFU_BootloaderOk()) {
         dfu_send("K dfu ok=0 err=guard\r\n");
+        return;
+    }
+    // Commands are serviced during TX too (app.c's 10 ms slice); see DFU_SafeReset.
+    if (DFU_Transmitting()) {
+        dfu_send("K dfu ok=0 err=tx\r\n");
         return;
     }
 

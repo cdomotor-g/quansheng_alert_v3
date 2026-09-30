@@ -74,10 +74,20 @@ void DFU_EmitBootLine(void);
 // ---------------------------------------------------------------------------
 // Reset-loop / autostart policy (App/app/app.c, plan section 7).
 
-// Arm DFU for the next boot: if the bootloader guard passes, clear the abnormal
-// counter, set the magic and NVIC_SystemReset(). Returns false (without
-// resetting) when the guard fails. Used by 0x05E0 and by the auto-heal path.
+// Arm DFU for the next boot: if the bootloader guard passes and the radio is not
+// transmitting, clear the abnormal counter, set the magic and reset through
+// DFU_SafeReset(). Returns false (without resetting) otherwise. Used by 0x05E0
+// and by the auto-heal path. Needs BK4819_Init() to have run.
 bool DFU_RequestDfu(void);
+
+// True while the radio transmits (gCurrentFunction == FUNCTION_TRANSMIT).
+bool DFU_Transmitting(void);
+
+// NVIC_SystemReset(), after taking the BK4829 out of TX (PA bias and enable off,
+// REG_30 idle): the chip keeps its TX state across an MCU reset and the stock
+// bootloader never touches it, so a reset that ends in DFU would otherwise leave
+// a carrier on. Needs BK4819_Init() to have run.
+void DFU_SafeReset(void) __attribute__((noreturn));
 
 // True while the app should refuse to autostart the sweep (>= 3 abnormal resets).
 bool DFU_AutostartBlocked(void);
@@ -90,6 +100,10 @@ bool DFU_AutoDfuDue(void);
 // Contract D -> B: the soft watchdog for the (blocking) ALERT loop.
 void DFU_WatchdogArm(bool on);   // B: on at APP_RunAlert entry, off at exit
 void DFU_WatchdogKick(void);     // B: once per main-loop pass inside APP_RunAlert
+
+// True once DFU_WatchdogArm(true) has run this boot, i.e. APP_RunAlert was
+// entered by any path; the autostart then has nothing left to start.
+bool DFU_AppEntered(void);
 
 // Called every SysTick (App/scheduler.c): services the soft watchdog and the
 // 60 s "healthy" timer that forgets the abnormal-reset history.

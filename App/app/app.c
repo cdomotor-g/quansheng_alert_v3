@@ -1618,9 +1618,10 @@ extern volatile uint8_t dtr_enable;   // App/usb/usbd_cdc_if.c: host has the por
 // ALERT-X1 boot policy (plan sections 2 and 7). Runs from the 10 ms slice while
 // the radio is still in normal mode. It prints the boot 'B' line once, holds a
 // 5 s window in which USB commands (including DFU) are serviced, then decides:
-//   - >= 5 abnormal resets: heal into DFU by itself (guard-checked);
 //   - >= 3 abnormal resets: stay in normal mode so a host can intervene;
-//   - otherwise: autostart the ALERT sweep.
+//   - otherwise: autostart the ALERT sweep, unless the app already ran.
+// The >= 5 heal into DFU is not here: Main() checks it as soon as the BK4829
+// is initialised, so a build that crashes in its first seconds still heals.
 // The 60 s "healthy" clear of the abnormal-reset counter is done in SysTick.
 static void AlertBootTask(void)
 {
@@ -1628,10 +1629,11 @@ static void AlertBootTask(void)
     static bool     announced;  // boot line sent
     static bool     decided;    // autostart decision made (runs once)
 
-    if (decided)
+    if (decided && announced)
         return;
 
-    ++ticks;
+    if (ticks < 0xFFFFu)
+        ++ticks;
 
     // USB output is dropped until the host asserts DTR, and at tick 0 the port
     // has not even enumerated, so a line sent then never reaches the host that
@@ -1649,15 +1651,21 @@ static void AlertBootTask(void)
         }
     }
 
+    if (decided)
+        return;
+
+    // Entered already (menu, key action, SWEEP_CTL op 7): APP_RunAlert blocks
+    // this task, so the countdown would otherwise resume after the user left
+    // the app and start it again behind their back.
+    if (DFU_AppEntered()) {
+        decided = true;
+        return;
+    }
+
     if (ticks < 500)            // 5 s
         return;
 
     decided = true;
-
-    if (DFU_AutoDfuDue()) {
-        DFU_RequestDfu();       // resets here if the bootloader guard passes
-        return;
-    }
 
     if (!DFU_AutostartBlocked())
         gRequestAlertApp = true;   // serviced by CheckKeys() -> APP_RunAlert()

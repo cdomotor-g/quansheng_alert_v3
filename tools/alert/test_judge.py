@@ -15,7 +15,14 @@ and the discriminator noise the window carries after squelch-lost.
              junk lines on the way; exit 1
   dead       every Phase 1 and Phase 3 arrangement twice, all noise -> exit 2
   short      the same with one row a burst short -> exit 3, naming the row
-  adc        AUD pass, confirmed bursts, 702 three times on ADC -> exit 0
+  edge       A5 (FFFFFFF0 edge sync, k = 4) decodes 702 in 4 bursts stored
+             LSB-first: found only at the firmware's 7-bit gate and with the
+             prepended sync left as programmed -> WORKS in lsb order; exit 0
+  adc        AUD pass, confirmed bursts, 702 three times on ADC -> exit 0,
+             with a non-qualifying opening (P BURST, no C line) before each
+             that the confirmation must not count
+  stream     the dead scenario, but S2 never streams and neither it nor B2
+             ever syncs on noise over 10 expected intervals -> still exit 2
   framing    radio.py's frames parsed the way uart.c parses them, and its
              demultiplexer on a reply packet mixed into the line stream
 
@@ -233,7 +240,10 @@ def scenario_structure(td, rnd):
     return p
 
 
-def scenario_dead(td, rnd, drop=None):
+def scenario_dead(td, rnd, drop=None, quiet_stream=None):
+    """quiet_stream: an S row whose engine never syncs on noise, so it never
+    streams: every burst finds it searching (src=open), and it and its base
+    row sit armed for longer than 10 expected noise-sync intervals."""
     w = LogWriter()
     w.put('B ver=0123abcd rst=por n=0 bl=22CDCECB')
     # alert.c's index space: Phase 3 is 40 generated REG_58 codes at 64..103
@@ -247,12 +257,41 @@ def scenario_dead(td, rnd, drop=None):
             if drop == tag and npass == 1:
                 continue
             w.arr(tag, idx=idx, t2=t2, ph=ph, v=v)
-            w.heartbeats(2)
-            stream = tag in sj.STREAM_TAGS
+            quiet = quiet_stream is not None and v == 0 and \
+                tag in (quiet_stream, sj.STREAM_BASE[quiet_stream])
+            w.heartbeats(170 if quiet else 2)
+            stream = tag in sj.STREAM_TAGS and tag != quiet_stream
             s = [rnd.randint(0, 1) for _ in range(160)]
             w.burst_lines(idx, t2, s, store(s), src='pre' if stream else 'open',
                           dt=-2000 if stream else 50, pn='P')
-    p = os.path.join(td, 'dead%s.log' % ('-' + drop if drop else ''))
+    p = os.path.join(td, 'dead%s%s.log' % ('-' + drop if drop else '',
+                                          '-' + quiet_stream if quiet_stream else ''))
+    w.write(p)
+    return p
+
+
+def scenario_edge(td, rnd):
+    """A5: the engine synced on FFFFFFF0, the idle run and the start bit, so
+    the window holds the 28 idle samples the sync consumed (7 bits at k = 4,
+    under the usual 12-bit gate) and no preamble. The bytes after the sync are
+    stored LSB-first; the sync itself goes in as programmed."""
+    w = LogWriter()
+    w.put('B ver=0123abcd rst=por n=0 bl=22CDCECB')
+    w.put('L 5 A5 r58=3FC3 t2=1200 r70=80E0 t1=2100 sy=FFFFFFF0 s4=1 5c=5625 pol=S ph=1 v=00')
+    prefix = [1] * 28 + [0] * 4
+    for i in range(4):
+        w.heartbeats(10)
+        core = [x ^ 1 for x in slicer(neg_bits(eif_words(STATION, 200 + i)), 1200, rnd,
+                                        rate_err=rnd.uniform(-0.01, 0.01))]
+        e = core.index(0)                           # the first start edge after the preamble
+        while e + 4 < len(core) and core[e + 4] == 0:
+            e += 1                                  # a 5-sample start bit: the sync ends on its last
+        body = core[e + 4:] + [rnd.randint(0, 1) for _ in range(60)]
+        body += [0] * (-len(body) % 8)
+        s = prefix + body
+        w.burst_lines(5, 1200, s, sj.pack(prefix) + store(body, lsb=True),
+                      dt=rnd.randint(20, 90), pn='P')
+    p = os.path.join(td, 'edge.log')
     w.write(p)
     return p
 
@@ -262,13 +301,23 @@ def scenario_adc(td, rnd):
     w.put('B ver=0123abcd rst=por n=0 bl=22CDCECB')
     w.put('PT PA4 u1 d0 PB1 u1 d1')
     w.put('P ch=4 b=1 pa=0 src=M mean=2048 pp=12 rms=30 g13=80 g17=82 g21=79')
+    # the idle level is the louder tone bin: 10 dB over 121, not over 120
     w.put('P ch=4 b=1 pa=0 src=F mean=2048 pp=40 rms=60 g13=120 g17=118 g21=121')
     w.put('AUD pin=PA4B pa=0 floor_on=-75 floor_off=-76')
+    idx = w.arr('A1')
     for i in range(3):
         w.heartbeats(15)
+        # a noise flicker: BurstStop reports it, BurstFinish gates it (no C line)
+        w.put('P ch=4 b=1 pa=0 src=BURST mean=2048 pp=60 rms=70 g13=125 g17=120 g21=126')
+        w.put('P ch=9 b=1 pa=0 src=BURST mean=780 pp=10 rms=5 g13=40 g17=41 g21=40')
+        w.put('Y %s ms=900 pn=P sq=1 rssi=-60' % idx)
+        w.heartbeats(5)
         w.put('P ch=4 b=1 pa=0 src=BURST mean=2048 pp=900 rms=400 g13=%d g17=150 g21=%d'
               % (260 + i, 300 + i))
-        w.put('X ADC %d id=%d v=%d fmt=EIF pol=N inv=0 pos=40 known=1' % (50 + i, STATION, i))
+        w.put('P ch=9 b=1 pa=0 src=BURST mean=780 pp=10 rms=5 g13=40 g17=41 g21=40')
+        s = [1] * 16 + [rnd.randint(0, 1) for _ in range(560)]
+        b = w.burst_lines(idx, 1200, s, store(s), dt=40, pn='P')
+        w.put('X ADC %d id=%d v=%d fmt=EIF pol=N inv=0 pos=40 known=1' % (b, STATION, i))
     w.put('G ADOPT ADC v=0 id=702 rep=3')
     p = os.path.join(td, 'adc.log')
     w.write(p)
@@ -533,9 +582,28 @@ def main():
                                                                res['still_needed']),
               (code, res['still_needed']))
 
+        # S2 cannot stream: covered all the same, but only once it has had the time
+        code, res, text = judge([scenario_dead(td, rnd, quiet_stream='S2')])
+        check('stream: S2 never syncs on noise -> inapplicable, exit 2',
+              code == 2 and 'stream policy inapplicable' in text and 'S2' in text,
+              (code, res['still_needed']))
+
+        # edge sync, LSB-first bytes
+        code, res, text = judge([scenario_edge(td, rnd)])
+        a = by_tag(res)
+        check('edge: exit 0, A5 WORKS at the 7-bit edge-sync gate',
+              code == 0 and a['A5']['verdict'] == 'WORKS' and a['A5']['gate'] == 7,
+              (code, a['A5']['verdict'], a['A5']['gate'], a['A5']['repeat']))
+        check('edge: A5 decoded in lsb order, STRUCT in lsb order',
+              set(v.split('/')[1] for v in a['A5']['via']) == {'lsb'} and
+              a['A5']['struct'] == 1.0 and 'lsb' in a['A5']['struct_order'],
+              (a['A5']['via'], a['A5']['struct'], a['A5']['struct_order']))
+
         # ADC
         code, res, text = judge([scenario_adc(td, rnd)])
         check('adc: exit 0, ADC route works', code == 0 and res['adc']['works'], res['adc'])
+        check('adc: confirmation 3/3, the gated flickers not counted',
+              res['adc']['confirm'] == '3/3' and res['adc']['confirmed'], res['adc'])
 
         check_relay(check, td)
 

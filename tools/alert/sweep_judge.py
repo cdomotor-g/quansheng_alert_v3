@@ -17,7 +17,9 @@ arrangement, from its qualifying bursts:
           host's own decode of the H window with the edge slicer (the
           scan_samples.py port of ALERT_ScanSamples) and phase decimation for
           integer k, each over NEG/STD framing x both data senses x both bit
-          orders, under the same 12-idle-bit preamble gate as the firmware
+          orders, under the same preamble gate as the firmware: 12 idle bits,
+          or for an edge sync (A5 FFFFFFF0, A6 FFFFFFC0) what the sync's own
+          idle run provides, from the L line exactly as MinIdleBits() does
   REPEAT  most separate bursts in which one table station decoded under the
           same (framing, sense) path
   chance  each capture's run lengths shuffled up to 200 times and decoded by
@@ -50,7 +52,17 @@ preamble run (the longest run starting in the window's first 250 ms) through
 one frame, not over the whole window. The window runs 40 ms past squelch-lost
 and may start 100 ms before the open, and the discriminator noise there adds
 more short runs than a whole burst has runs, so a perfect capture would fail.
-Without H lines the firmware's own C-line figures are used, as they are.
+The firmware's bt score (alert.c StructPass) is computed the same way. An edge
+sync leaves no preamble in the window, only the sync's own idle run, which
+then stands in for the 20k lead. Without H lines the firmware's own C-line
+figures (whole window) are used, as they are.
+
+The sync pattern alert.c writes in front of a stream is stored as programmed,
+so the lsb order leaves it alone when a window starts with it.
+
+S1/S2 test a stream a noise sync started. If an S row and its base (A1, B2)
+together saw no noise sync in 10 expected intervals, no such stream can start
+there: the row counts as covered ("stream policy inapplicable").
 
 A burst that only the firmware decoded still counts: the H lines may have
 been lost. BITS-NO-DECODE means the bits are there and the bit order, the
@@ -96,6 +108,8 @@ FEW_BITS = 0.2
 STRUCT_MAJORITY = 2.0 / 3.0
 REPEAT_WORKS = 3
 MIN_BURSTS_DEAD = 2         # per arrangement, for "FSK route dead"
+STREAM_BASE = {'S1': 'A1', 'S2': 'B2'}   # the rows whose registers S1/S2 reuse
+STREAM_IDLE_INTERVALS = 10  # noise-sync intervals with none seen: stream policy inapplicable
 
 # Phase 1 rows (X1_PLAN.md s3.2), by tag; S1/S2 are judged on stream-coincident bursts
 PHASE1_TAGS = ('A1', 'A3', 'B2', 'A2', 'A4', 'A5', 'B1', 'A7', 'A8', 'C1', 'A6', 'A9',
@@ -142,12 +156,12 @@ def edge_slicer():
     return _SS or None
 
 
-def _edge_scan(ss, buf, nsamp, spb_q8, pc, inv):
+def _edge_scan(ss, buf, nsamp, spb_q8, pc, inv, gate=MIN_IDLE_BITS):
     """ss.scan_samples, or [] and the edge slicer switched off if its API has
     moved under us: a judge that stops is worse than one that loses a path."""
     global _SS
     try:
-        return ss.scan_samples(buf, nsamp, spb_q8, pc, bool(inv), MIN_IDLE_BITS)
+        return ss.scan_samples(buf, nsamp, spb_q8, pc, bool(inv), gate)
     except (TypeError, AttributeError, ValueError, IndexError) as e:
         print('scan_samples.py failed (%r): continuing on phase decimation alone' % e,
               file=sys.stderr)
@@ -181,9 +195,41 @@ def pack(samples):
     return bytes(buf)
 
 
-def in_order(data, order):
-    """Repack the stored bytes so the sample sequence reads MSB-first."""
-    return data if order == 'msb' else bytes(REV[b] for b in data)
+def in_order(data, order, prefix=b''):
+    """Repack the stored bytes so the sample sequence reads MSB-first.
+
+    alert.c's StreamBegin writes the sync pattern in front of a stream as it was
+    programmed, whatever order the engine puts samples in a byte, so when the
+    window starts with it (a stream that began inside the window) those bytes
+    stay as they are. Reversing them too would turn FFFFFFF0 into FFFFFF0F and
+    put four bogus samples in front of the first word of an edge sync."""
+    if order == 'msb':
+        return data
+    keep = len(prefix) if prefix and data.startswith(prefix) else 0
+    return data[:keep] + bytes(REV[b] for b in data[keep:])
+
+
+def sync_info(params, t2):
+    """(prefix, edge, gate) for an arrangement, from its L-line fields.
+
+    prefix: the sync bytes alert.c writes in front of a stream (StreamBegin);
+    edge:   an edge sync's idle run in samples, else 0 (EdgeSyncRun);
+    gate:   the decoder's idle gate in bits (MinIdleBits): 12, or for an edge
+            sync min(12, edge x 300 / TONE2), since that run is all the idle
+            such a capture holds before its first start edge."""
+    sy = ival(params.get('sy'), 16)
+    if sy is None:
+        return b'', 0, MIN_IDLE_BITS
+    s4 = params.get('s4') == '1'
+    nb = 32 if s4 else 16
+    top = (sy >> 31) & 1
+    run = 1
+    while run < nb and ((sy >> (31 - run)) & 1) == top:
+        run += 1
+    prefix = (sy & 0xFFFFFFFF).to_bytes(4, 'big')[:4 if s4 else 2]
+    if run < 8 or run >= nb or not t2:
+        return prefix, 0, MIN_IDLE_BITS
+    return prefix, run, min(MIN_IDLE_BITS, run * 300 // t2)
 
 
 def run_lengths(s):
@@ -215,7 +261,7 @@ def window_stats(s, k):
             'lead': runs[0], 'mx': max(runs), 'm': m, 'base': 2.0 ** (1 - m)}
 
 
-def struct_test(s, k, t2):
+def struct_test(s, k, t2, edge=0):
     """STRUCT on the burst itself: the preamble run and the frame after it.
 
     Over the whole window a real burst cannot pass. The window runs 40 ms past
@@ -225,7 +271,12 @@ def struct_test(s, k, t2):
     the lead is the longest run starting in the first 250 ms (the preamble,
     wherever the window began), and rk and transitions are measured from it
     through one frame. Noise still fails: its longest early run is ~8 samples
-    against the 20k required."""
+    against the 20k required.
+
+    edge: an edge sync's idle run. Such a window has no preamble; when it starts
+    with the sync (its first run is that idle run) the core starts there, since
+    a later idle gap or the tail after the frame can be longer, and the lead
+    needed comes down to that run. alert.c StructPass does exactly this."""
     if k < STRUCT_MIN_K or len(s) < 2:
         return {'ok': False, 'rk': 0.0, 'tr': 0.0, 'lead': 0}
     runs = run_lengths(s)
@@ -237,22 +288,26 @@ def struct_test(s, k, t2):
         if r > best:
             best, best_at, best_i = r, pos, i
         pos += r
+    if edge and runs[0] >= edge:
+        best, best_at, best_i = runs[0], 0, 0
     core = s[best_at:best_at + best + int(FRAME_BITS * k)]
     cruns = run_lengths(core)
     m = m_for(k)
     rk = sum(1 for r in cruns if r >= m) / len(cruns)
     tr = (len(cruns) - 1) / max(1, len(core) - 1)
-    ok = rk >= STRUCT_RK and tr <= STRUCT_TR_K / k and best >= STRUCT_LEAD_K * k
+    need = min(STRUCT_LEAD_K * k, edge) if edge else STRUCT_LEAD_K * k
+    ok = rk >= STRUCT_RK and tr <= STRUCT_TR_K / k and best >= need
     return {'ok': ok, 'rk': rk, 'tr': tr, 'lead': best}
 
 
-def host_decode(data, nsamp, t2, use_edge=True, stop_on=None):
+def host_decode(data, nsamp, t2, use_edge=True, stop_on=None, gate=MIN_IDLE_BITS, prefix=b''):
     """Every reading the host can get from one stored window.
 
     Edge slicer (when present) over both bit orders x NEG/STD x both senses;
     phase decimation over every phase: for integer k beside the edge slicer,
     and for any k when the edge slicer is missing (fractional steps then).
     stop_on: a set of ids; return at the first reading in it (chance control).
+    gate, prefix: the arrangement's idle gate and sync bytes (sync_info).
     """
     out = []
     if nsamp < 10 or not t2:
@@ -262,11 +317,11 @@ def host_decode(data, nsamp, t2, use_edge=True, stop_on=None):
     spb_q8 = (256 * t2 + 150) // 300
     integer_k = t2 % 300 == 0
     for order in ORDERS:
-        buf = in_order(data, order)
+        buf = in_order(data, order, prefix)
         if ss is not None:
             for pol, pc in (('N', ss.POL_NEGATIVE), ('S', ss.POL_STANDARD)):
                 for inv in (0, 1):
-                    for r in _edge_scan(ss, buf, nsamp, spb_q8, pc, inv):
+                    for r in _edge_scan(ss, buf, nsamp, spb_q8, pc, inv, gate):
                         fmt, rid, val, pos = _reading(r)
                         out.append({'method': 'edge', 'order': order, 'pol': pol, 'inv': inv,
                                     'id': rid, 'value': val, 'fmt': fmt, 'pos': pos})
@@ -286,7 +341,7 @@ def host_decode(data, nsamp, t2, use_edge=True, stop_on=None):
                 db = pack([x ^ inv for x in d]) if inv else pack(d)
                 for pol, pc in (('N', am.POL_NEGATIVE), ('S', am.POL_STANDARD)):
                     for (fmt, rid, val), pos, _ in am.scan_polarity(
-                            db, len(d), pc, MAX_GAP_BITS, 8, MIN_IDLE_BITS):
+                            db, len(d), pc, MAX_GAP_BITS, 8, gate):
                         out.append({'method': 'dec%d' % ph, 'order': order, 'pol': pol,
                                     'inv': inv, 'id': rid, 'value': val, 'fmt': fmt,
                                     'pos': int(ph + pos * k)})
@@ -309,13 +364,14 @@ def shuffle_runs(s, rnd):
 
 def _chance_task(task):
     """Worker: table-hit count over `count` run-length shuffles of one window."""
-    data, nsamp, t2, seed, count, table, use_edge = task
+    data, nsamp, t2, seed, count, table, use_edge, gate, prefix = task
     s = unpack(data, nsamp)
     rnd = random.Random(seed)
     hits = 0
     for _ in range(count):
         sh = pack(shuffle_runs(s, rnd))
-        if any(r['id'] in table for r in host_decode(sh, nsamp, t2, use_edge, table)):
+        if any(r['id'] in table
+               for r in host_decode(sh, nsamp, t2, use_edge, table, gate, prefix)):
             hits += 1
     return hits
 
@@ -338,12 +394,14 @@ class ChanceRunner:
             self.pool.shutdown()
 
 
-def chance_control(windows, n_bursts, decode, t2, table, runner, shuffles, seed, use_edge):
+def chance_control(windows, n_bursts, decode, t2, table, runner, shuffles, seed, use_edge,
+                   gate=MIN_IDLE_BITS, prefix=b''):
     """Expected chance table-hit bursts E over n_bursts, and whether
     decode >= 20 E. Stops early once the outcome is settled: a fail as soon as
     the point estimate at `shuffles` can no longer pass, a pass as soon as a
     ~95% upper bound on E already does (so it is never looser than running
-    all of them). windows: [(bytes, nsamp)] of the bursts with H data."""
+    all of them). windows: [(bytes, nsamp)] of the bursts with H data. The
+    shuffles are decoded under the same gate as the real windows."""
     if not windows or decode <= 0:
         return {'E': None, 'pass': False, 'shuffles': 0, 'hits': 0}
     scale = n_bursts / len(windows)       # bursts without H data: assume the same rate
@@ -351,7 +409,7 @@ def chance_control(windows, n_bursts, decode, t2, table, runner, shuffles, seed,
     step = 20
     while done < shuffles:
         c = min(step, shuffles - done)
-        tasks = [(d, n, t2, seed + 7919 * i + done, c, table, use_edge)
+        tasks = [(d, n, t2, seed + 7919 * i + done, c, table, use_edge, gate, prefix)
                  for i, (d, n) in enumerate(windows)]
         hits += sum(runner.map(tasks))
         done += c
@@ -446,6 +504,8 @@ class Log:
         self.boots = []
         self.files = 0
         self.timed = False
+        self.pburst = []            # the P src=BURST lines of the latest squelch opening
+        self.prev_pburst = False
 
     # time: ISO stamps from radio.py; [HH:MM:SS.mmm] from alertmon (wraps at midnight)
     def _stamp(self, line):
@@ -505,6 +565,8 @@ class Log:
         self.cur = {}
         self.t = None
         self.tod_base = None
+        self.pburst = []
+        self.prev_pburst = False
         with open(path, 'r', encoding='ascii', errors='replace') as f:
             for raw in f:
                 self.feed(raw)
@@ -520,6 +582,7 @@ class Log:
             self._dispatch(tag, tok, line)
         except (IndexError, KeyError, ValueError):
             pass                            # a torn line: skip it, never stop
+        self.prev_pburst = tag == 'P' and 'src=BURST' in tok
 
     def _dispatch(self, tag, tok, line):
         if tag == 'D':
@@ -546,6 +609,7 @@ class Log:
             self.sess += 1
             self.cur = {}
             self.boots.append(line)
+            self.pburst = []
         elif tag == 'C':
             f = kv(tok[2:])
             k100, num = ival(f.get('k')), ival(f.get('b'))
@@ -553,6 +617,13 @@ class Log:
                 raise ValueError('C line without a burst number')
             b = self._burst(tok[1], num, 3 * k100 if k100 else None)
             b.c = f
+            # ALERTADC_BurstStop reports every squelch opening while the ADC is
+            # armed, before BurstFinish decides whether it qualified; only the
+            # group right before a C line belongs to a qualifying burst, and
+            # those are all the firmware's confirmation looks at.
+            for p in self.pburst:
+                p['_paired'] = '1'
+            self.pburst = []
         elif tag == 'H':
             m = H_LINE.match(line)
             if m:
@@ -572,7 +643,12 @@ class Log:
             f = kv(tok[2:])
             self._arr(tok[1]).fin.append((ival(f.get('words')), ival(f.get('ms'))))
         elif tag in ('P', 'PT', 'AUD'):
-            self.census.append((tag, kv(tok[1:]), line))
+            f = kv(tok[1:])
+            self.census.append((tag, f, line))
+            if tag == 'P' and f.get('src') == 'BURST':
+                if not self.prev_pburst:
+                    self.pburst = []        # a new opening: the last one never qualified
+                self.pburst.append(f)
         elif tag == 'G':
             self.adopt.append(line)
         # A, ALERT, Z, K, W, T, U and anything newer: not needed for a verdict
@@ -584,12 +660,14 @@ class Log:
 def judge_arr(arr, table, runner, opts):
     t2 = arr.t2
     k = t2 / 300.0 if t2 else 0.0
+    prefix, edge, gate = sync_info(arr.params, t2)
     # ADC decodes arrive as X lines only; every FSK burst has its C line
     bursts = [b for b in arr.bursts if b.c is not None or arr.idx == 'ADC']
     for b in bursts:
         b.c = b.c or {}
     r = OrderedDict(idx=arr.idx, tag=arr.tag, v=arr.v, t2=t2, k=round(k, 3),
-                    stream=arr.stream, phases=sorted(arr.phases), bq=len(bursts))
+                    stream=arr.stream, phases=sorted(arr.phases), bq=len(bursts),
+                    gate=gate)
 
     # BITS
     fills = []
@@ -637,15 +715,16 @@ def judge_arr(arr, table, runner, opts):
         if nsamp >= 16:
             windows.append((data, nsamp))
             for order in ORDERS:
-                s = unpack(in_order(data, order), nsamp)
+                s = unpack(in_order(data, order, prefix), nsamp)
                 if order == 'msb' and crk is None:
                     st = window_stats(s, k)
                     crk, cbase = st['rk'] * 1000, st['base'] * 1000
-                if t2 and struct_test(s, k, t2)['ok']:
+                if t2 and struct_test(s, k, t2, edge)['ok']:
                     row['struct'].append(order)
             if not complete:
                 missing_h += 1          # some H lines lost: judged on what arrived
-            row['hits'] = host_decode(data, nsamp, t2, not opts.no_edge) if t2 else []
+            row['hits'] = (host_decode(data, nsamp, t2, not opts.no_edge, None, gate, prefix)
+                           if t2 else [])
         else:
             if expected:
                 missing_h += 1
@@ -653,7 +732,7 @@ def judge_arr(arr, table, runner, opts):
             ctr, clead = ival(b.c.get('tr')), ival(b.c.get('lead'))
             if (k >= STRUCT_MIN_K and crk is not None and ctr is not None and clead is not None
                     and crk >= 1000 * STRUCT_RK and ctr <= 1000 * STRUCT_TR_K / k
-                    and clead >= STRUCT_LEAD_K * k):
+                    and clead >= (min(STRUCT_LEAD_K * k, edge) if edge else STRUCT_LEAD_K * k)):
                 row['struct'].append('msb')
         if k >= STRUCT_MIN_K:
             struct_n += 1
@@ -716,7 +795,7 @@ def judge_arr(arr, table, runner, opts):
         r['chance'] = chance_control(windows, len(bursts), decoded, t2, table, runner,
                                      opts.shuffles,
                                      opts.seed + zlib.crc32(arr.label().encode()) % 100000,
-                                     not opts.no_edge)
+                                     not opts.no_edge, gate, prefix)
     else:
         r['chance'] = {'E': None, 'pass': False, 'shuffles': 0, 'hits': 0}
 
@@ -756,6 +835,29 @@ def verdict(r):
     return 'MIXED'
 
 
+def stream_inapplicable(results):
+    """S rows whose engine never syncs on noise: counting the base row's time
+    too, no sq=0 sync in STREAM_IDLE_INTERVALS expected intervals (2^16 / (2
+    TONE2) seconds each). No noise-started stream can exist there, so stream
+    coincidence is impossible rather than merely not seen yet."""
+    armed, syncs, t2s = defaultdict(float), defaultdict(int), {}
+    for r in results:
+        if r['v'] == 0 and r['tag'] in PHASE1_TAGS:
+            armed[r['tag']] += r['armed_s'] or 0.0
+            syncs[r['tag']] += r['noise_syncs'] or 0
+            if r['t2']:
+                t2s.setdefault(r['tag'], r['t2'])
+    out = []
+    for t in STREAM_TAGS:
+        pair = (t, STREAM_BASE[t])
+        t2 = t2s.get(t) or t2s.get(STREAM_BASE[t])
+        secs = sum(armed[x] for x in pair)
+        if (t2 and not sum(syncs[x] for x in pair)
+                and secs >= STREAM_IDLE_INTERVALS * 65536.0 / (2.0 * t2)):
+            out.append(t)
+    return out
+
+
 def coverage(results):
     """What "FSK route dead" still needs; an empty list means nothing."""
     need = []
@@ -770,8 +872,9 @@ def coverage(results):
     short = [t for t in PHASE1_TAGS if t not in STREAM_TAGS and by_tag[t][0] < MIN_BURSTS_DEAD]
     if short:
         need.append('Phase 1 rows with < %d bursts: %s' % (MIN_BURSTS_DEAD, ' '.join(short)))
+    moot = stream_inapplicable(results)
     for t in STREAM_TAGS:
-        if by_tag[t][1] < MIN_BURSTS_DEAD:
+        if by_tag[t][1] < MIN_BURSTS_DEAD and t not in moot:
             need.append('%s: %d of %d stream-coincident bursts' % (t, by_tag[t][1],
                                                                    MIN_BURSTS_DEAD))
     if p3 < PHASE3_ROWS:
@@ -783,8 +886,10 @@ def coverage(results):
 def judge_adc(log, results):
     """ADC route: AUD pass, burst confirmation, REPEAT >= 3 on idx ADC.
 
-    Confirmation is s5's: on the first 3 bursts, 1300 and 2100 Hz energy on the
-    chosen pin both >= 10 dB (100 in dB x10) above that pin's F-idle level."""
+    Confirmation is s5's, as the firmware applies it: on the first 3 qualifying
+    bursts (the P src=BURST lines right before a C line), 1300 and 2100 Hz
+    energy on the chosen pin both >= 10 dB (100 in dB x10) above that pin's
+    F-idle level, the louder of its F g13 and g21 (alert_adc.c Consider)."""
     aud = [f for t, f, _ in log.census if t == 'AUD']
     pins = [f.get('pin', 'none') for f in aud]
     aud_pass = any(p != 'none' for p in pins)
@@ -798,7 +903,7 @@ def judge_adc(log, results):
         if f.get('src') == 'F':
             idle[where] = f
             idle[where[0]] = f
-        elif (f.get('src') == 'BURST' and len(confirm) < 3 and
+        elif (f.get('src') == 'BURST' and f.get('_paired') and len(confirm) < 3 and
               (chosen is None or where[0] == chosen)):
             base = idle.get(where) or idle.get(where[0])
             if base is None:
@@ -806,7 +911,8 @@ def judge_adc(log, results):
             g13, g21 = ival(f.get('g13')), ival(f.get('g21'))
             b13, b21 = ival(base.get('g13')), ival(base.get('g21'))
             if None not in (g13, g21, b13, b21):
-                confirm.append(g13 >= b13 + 100 and g21 >= b21 + 100)
+                lvl = max(b13, b21)
+                confirm.append(g13 >= lvl + 100 and g21 >= lvl + 100)
     adc = [r for r in results if r['idx'] == 'ADC']
     repeat = max((r['repeat'] for r in adc), default=0)
     # the firmware only runs the ADC decoder once it has confirmed the pin itself
@@ -845,7 +951,8 @@ def report(log, results, adc, code, why, need, opts):
     nb = sum(r['bq'] for r in results)
     print('ALERT-X1 sweep judge: %d log(s), %d boot(s), %d arrangement(s), %d qualifying bursts'
           % (log.files, len(log.boots), len(results), nb))
-    print('host decode: %s + phase decimation, %d-bit preamble gate, %d table ids'
+    print('host decode: %s + phase decimation, %d-bit preamble gate (less on edge syncs,'
+          ' as in the firmware), %d table ids'
           % ('edge slicer (scan_samples.py)' if ss and not opts.no_edge
              else 'NO edge slicer (scan_samples.py missing)', MIN_IDLE_BITS, len(opts.table)))
     if not log.timed:
@@ -875,6 +982,8 @@ def report(log, results, adc, code, why, need, opts):
             extra.append('%d stream-coincident' % r['stream_coincident'])
         if r['missing_h']:
             extra.append('%d without full H' % r['missing_h'])
+        if r['gate'] != MIN_IDLE_BITS:
+            extra.append('gate %d' % r['gate'])
         print('%-4s %-5s %2s %5s %1s %4d %s %6s %-12s %3d %3d %13s %5s  %s%s'
               % (r['idx'], r['tag'][:5], r['v'], r['t2'] or '?', 'T' if r['stream'] else 'S',
                  r['bq'], fmt_frac(r['bits']), sync, struct, r['decode'], r['repeat'], chance,
@@ -889,6 +998,10 @@ def report(log, results, adc, code, why, need, opts):
         med = sorted(fin)[len(fin) // 2]
         print('RX_FINISHED: median %d words after sync (~1024: the 11-bit REG_5D length works;'
               ' ~128: it does not)' % med)
+    moot = stream_inapplicable([r for r in results if r['idx'] != 'ADC'])
+    if moot:
+        print('stream policy inapplicable (no noise sync in %d expected intervals): %s'
+              % (STREAM_IDLE_INTERVALS, ', '.join(moot)))
     for ln in log.adopt:
         print(ln)
     if adc['aud']:

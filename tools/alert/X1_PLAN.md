@@ -170,7 +170,7 @@ After Phase 3 the sweep returns to Phase 1 passes and runs indefinitely; scores 
    - bq: qualifying bursts
    - bb: bursts delivering ≥ 50% of the expected samples (window_ms × TONE2/1000)
    - bs: in-burst syncs, counted over bursts where the engine was searching at open
-   - bt: structure passes (rk ≥ 0.80, transitions ≤ 0.6/k, lead ≥ 20k; only for k ≥ 3)
+   - bt: structure passes (rk ≥ 0.80, transitions ≤ 0.6/k, lead ≥ 20k; only for k ≥ 3). Measured as sweep_judge.struct_test does (alert.c StructPass): lead = the longest run starting in the window's first 250 ms, rk and transitions from it through 44k samples, because the pre-roll and drain tail sink any whole-window figure. Edge syncs (A5/A6): the sync's idle run is the lead.
    - dx: bursts with any decode
    - dt: bursts with a table-station decode
    - rep: the largest number of separate bursts in which one station ID decoded
@@ -203,6 +203,9 @@ Tests: extend tools/alert/test_decode.c (already run in CI):
 - frames at k ∈ {1.736, 3.47, 4, 4.33, 4.67, 5, 6, 8}, rate error ±2%, a 60-bit preamble, all four sense/framing combinations → must decode;
 - 10^5 samples of noise → 0 table hits;
 - only 8 idle bits before word 0 → rejected.
+- edge-sync windows (A5/A6 prefix, gate 7/4) → decode at their own gate, never at 12.
+
+Known gaps, accepted: at k ≈ 1.75 (B1, B3) the per-word timing fit loses a few percent of clean frames (42/48 in section 7) when a word ends in a long run with nothing to constrain the late bits; k between 1.75 and 3.47 (host recipes with TONE2 ≈ 600 Hz) is untested and decodes poorly.
 
 ## 5. Audio-pin census and ADC decoder
 
@@ -276,7 +279,7 @@ If audio only appears with PA8 on, the speaker plays the bursts. The owner may w
 
 - **HardFault** (Core/Src/py32f071_it.c:57): record reason "fault", increment the counter, `NVIC_SystemReset()`. Today it spins forever.
 - **Soft watchdog** in `SysTick_Handler` (App/scheduler.c:48): armed only inside APP_RunAlert. If the loop has not kicked it for 5 s, record "wd" and reset.
-- **Reset loops.** Clear the counter after 60 s of healthy running. At 3 consecutive abnormal resets, skip autostart. At 5, enter the DFU trampoline automatically, so a broken build heals into DFU.
+- **Reset loops.** Clear the counter after 60 s of healthy running. At 3 consecutive abnormal resets, skip autostart. At 5, enter the DFU trampoline automatically, so a broken build heals into DFU. That check runs in Main() right after BK4819_Init(), not after the 5 s window, so a build that crashes in its first seconds still heals; DFU entry is refused while transmitting, and every software reset takes the BK4829 out of TX first (it keeps its TX state across an MCU reset, and DFU never re-initialises it).
 - **Autostart.** A 5 s delay after boot, then `gRequestAlertApp = true`, using the existing service point at App/app/app.c:1537. The sweep starts automatically unless an arrangement is adopted.
 
 ## 8. USB lines (ASCII, CRLF) and commands

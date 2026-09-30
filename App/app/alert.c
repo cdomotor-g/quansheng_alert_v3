@@ -519,6 +519,7 @@ static void AudioPath(void)
 static uint8_t  capBuf[256];
 static uint8_t  ringHead;
 static uint16_t capLen;          // bytes since the current stream began (sync prefix included)
+static uint8_t  capPre;          // bytes of sync prefix at the start of that stream (0, 2, 4)
 static uint16_t openLen;         // bytes since the squelch opened
 static uint16_t validLen;        // bytes since the ring was last linearized in place
 static uint16_t syncWords;       // words since the sync, for the F line
@@ -537,6 +538,11 @@ static char     burstPN;
 static bool     searchAtOpen;
 static bool     syncInBurst;
 static bool     burstTainted;    // re-armed mid-burst: the window is not one arrangement's
+// The loop was just blocked - a full arm (~30 ms), the census (~3 s), a flash
+// write. A squelch edge first seen right after one may be long past: the
+// opening was never captured and the engine may have been reprogrammed under
+// it, so that burst is tainted rather than scored as clean.
+static bool     blocked;
 
 #define DRAIN_MS       40u       // squelch lost -> BurstFinish; no word left stranded
 #define BURST_MAX_MS   1500u     // longer than this is not an ALERT burst
@@ -710,6 +716,7 @@ static void ArrArm(void)
 	syncSeen  = false;
 	wordXor   = 0;
 	armMs     = nowMs;
+	blocked   = true;
 	if (sqOpen || draining)
 		burstTainted = true;
 }
@@ -945,6 +952,7 @@ static void Persist(void)
 	DFU_WatchdogKick();
 	SETTINGS_SaveSettings();
 	DFU_WatchdogKick();
+	blocked = true;
 }
 
 static void Adopt(uint8_t idx, uint8_t var, uint16_t id, uint8_t rep)
@@ -991,9 +999,9 @@ static void Resume(void)
 static void Deliver(const AlertReading_t *r, int n, int16_t rssi);
 
 // For an edge sync (a run of idle then the start bit, like FFFFFFF0) the
-// capture holds only that run of idle before the first start edge, so the
-// decoder's idle gate has to come down to what the sync word provides.
-static uint8_t MinIdleBits(void)
+// capture holds only that run of idle before the first start edge. Its length
+// in samples, or 0 when the sync is a steady preamble or alternating.
+static uint8_t EdgeSyncRun(void)
 {
 	const uint32_t pat = ((uint32_t)cur.s01 << 16) | cur.s23;
 	const uint8_t  nb  = (cur.r59 & ARR_59_S4) ? 32u : 16u;
@@ -1001,15 +1009,83 @@ static uint8_t MinIdleBits(void)
 	uint8_t run = 1;
 	while (run < nb && ((pat >> (31u - run)) & 1u) == top)
 		run++;
-	if (run < 8u || run >= nb)
-		return 12u;              // a steady preamble, or alternating: not an edge sync
+	return (run < 8u || run >= nb) ? 0u : run;
+}
+
+// ... so the decoder's idle gate has to come down to what the sync provides.
+// tools/alert/sweep_judge.py (min_idle_bits) computes the same from the L line.
+static uint8_t MinIdleBits(void)
+{
+	const uint8_t run = EdgeSyncRun();
+	if (!run)
+		return 12u;
 	const uint32_t bits = (uint32_t)run * 300u / cur.t2hz;
 	return (uint8_t)(bits < 12u ? bits : 12u);
 }
 
-static void BitReverse(uint16_t len)
+// STRUCT (plan section 3.4, k >= 3 only), measured as sweep_judge.struct_test
+// measures it, so the firmware's Phase 2/3 decisions and the judge agree. Over
+// the whole window a real burst cannot pass: the window may start 100 ms before
+// the open inside a noise-started stream and always runs DRAIN_MS plus the
+// squelch's own close delay past the burst, and that noise adds more short runs
+// than a whole burst has runs. So the lead is the longest run that starts in
+// the window's first 250 ms (the preamble, wherever the window began), and rk
+// and transitions are taken from it through one frame (44 bits). Noise still
+// fails: its longest early run is a few samples against the 20k required.
+//
+// An edge sync leaves no preamble in the window, only the sync's own idle run.
+// When the window starts with it, the core starts there (a gap between frames,
+// or the idle after the last, can be longer) and the lead needed comes down to
+// that run.
+static bool StructPass(uint32_t n, uint16_t t2, uint8_t m)
 {
-	for (uint16_t i = 0; i < len; i++) {
+	if (t2 < 900u || n < 2u)
+		return false;
+	const uint8_t  edge    = EdgeSyncRun();
+	const uint32_t horizon = (uint32_t)t2 / 4u;               // 250 ms of samples
+	uint32_t best = 0, bestAt = 0, pos = 0, run = 0, first = 0;
+	for (uint32_t i = 0; i < n && pos < horizon; i++) {
+		run++;
+		if (i + 1u == n || ALERT_GetBit(capBuf, i + 1u) != ALERT_GetBit(capBuf, i)) {
+			if (!pos)         first = run;
+			if (run > best) { best = run; bestAt = pos; }
+			pos += run;
+			run = 0;
+		}
+	}
+	if (edge && first >= edge) {
+		best   = first;
+		bestAt = 0;
+	}
+	uint32_t end = bestAt + best + 44u * t2 / 300u;          // int(FRAME_BITS * k)
+	if (end > n)
+		end = n;
+	uint32_t trans = 0, runs = 0, runsM = 0;
+	run = 0;
+	for (uint32_t i = bestAt; i < end; i++) {
+		run++;
+		if (i + 1u == end || ALERT_GetBit(capBuf, i + 1u) != ALERT_GetBit(capBuf, i)) {
+			if (i + 1u < end) trans++;
+			runs++;
+			if (run >= m) runsM++;
+			run = 0;
+		}
+	}
+	const uint32_t coreLen = end - bestAt;
+	uint32_t leadMin = (t2 + 14u) / 15u;                      // 20k samples, rounded up
+	if (edge && edge < leadMin)
+		leadMin = edge;
+	// rk >= 0.80, transitions / sample <= 0.6 / k, exactly (no per-mille rounding)
+	return runs && runsM * 5u >= runs * 4u && trans * t2 <= 180u * (coreLen > 1u ? coreLen - 1u : 1u) &&
+	       best >= leadMin;
+}
+
+// The prefix StreamBegin wrote is in programmed order already, whatever the
+// engine does inside a byte, so it is skipped (sweep_judge's lsb order does the
+// same); reversing it would put a 0F where an edge sync's F0 ends.
+static void BitReverse(uint16_t from, uint16_t len)
+{
+	for (uint16_t i = from; i < len; i++) {
 		uint8_t b = capBuf[i];
 		b = (uint8_t)(((b & 0x55u) << 1) | ((b & 0xAAu) >> 1));
 		b = (uint8_t)(((b & 0x33u) << 2) | ((b & 0xCCu) >> 2));
@@ -1029,6 +1105,7 @@ static void BurstFinish(void)
 	if (adcRunning) {
 		adcN = ALERTADC_BurstStop(adcBits, (uint16_t)(sizeof(adcBits) * 8u));
 		adcRunning = false;
+		AudioPath();             // MONITOR may have changed during the burst; it wins
 	}
 	EmitPending();
 	redraw = true;
@@ -1063,8 +1140,10 @@ static void BurstFinish(void)
 		RingLinearize((uint8_t)(ringHead - len));
 		validLen = 0;            // everything behind the head is now out of order
 	}
+	// the window starts at the stream's start exactly when it holds all of it
+	const uint16_t pre = (len && len == capLen) ? capPre : 0u;
 	if (cfg.bitrev)
-		BitReverse(len);
+		BitReverse(pre, len);
 
 	// 2. statistics, in the order the decoder reads the bits
 	const uint32_t n = (uint32_t)len * 8u;
@@ -1088,9 +1167,9 @@ static void BurstFinish(void)
 		if (runs) rk = (uint16_t)((uint32_t)runsM * 1000u / runs);
 	}
 	const uint16_t base = (uint16_t)(1000u >> (m - 1u));  // rk of random bits: 2^(1-m)
-	// k >= 3 only: rk >= 0.80, transitions <= 0.6/k per sample, lead >= 20k
-	const bool structured = t2 >= 900u && rk >= 800u && (uint32_t)tr * t2 <= 180000u &&
-	                        (uint32_t)lead * 15u >= t2;
+	// The C line keeps the whole-window figures (plan section 8); the structure
+	// verdict is taken on the burst itself, see StructPass.
+	const bool structured = StructPass(n, t2, m);
 	const bool gotBits = n && (uint32_t)n * 2000u >= (uint32_t)win * t2;
 	lastRk = rk; lastTr = tr; lastLead = lead;
 
@@ -1098,11 +1177,14 @@ static void BurstFinish(void)
 	if (n >= 40u) {
 		const uint32_t spb = ((uint32_t)t2 * 256u + 150u) / 300u;
 		if (spb < 384u) {
-			// under 1.5 samples a bit (D1): one sample per bit, the old framer
-			nf  = ALERT_ScanBitsEx(capBuf, n, cfg.polarity, 20, false, r, 8);
+			// under 1.5 samples a bit (D1): one sample per bit, the old framer,
+			// behind the same 12-bit preamble gate as everything else. Ungated,
+			// 2048 random bits name a table station in ~5% of windows, and D1 is
+			// the negative control: a chance hit there would read as a decode.
+			nf  = ALERT_ScanBitsGated(capBuf, n, cfg.polarity, 20, false, 12u, r, 8);
 			nf0 = nf;
 			if (nf < 8)
-				nf += ALERT_ScanBitsEx(capBuf, n, cfg.polarity, 20, true, r + nf, 8 - nf);
+				nf += ALERT_ScanBitsGated(capBuf, n, cfg.polarity, 20, true, 12u, r + nf, 8 - nf);
 		} else if (spb <= ALERT_SPB_Q8_MAX) {
 			const uint8_t idle = MinIdleBits();
 			nf  = ALERT_ScanSamples(capBuf, n, spb, cfg.polarity, false, idle, r, 8);
@@ -1112,10 +1194,12 @@ static void BurstFinish(void)
 		}
 	}
 	if (adcN >= 40u) {
-		na  = ALERT_ScanBitsEx(adcBits, adcN, cfg.polarity, 20, false, r + nf, 12 - nf);
+		// Gated as well: the demodulator starts at the squelch open, well inside
+		// the preamble, so a real frame always has its 12 idle bits.
+		na  = ALERT_ScanBitsGated(adcBits, adcN, cfg.polarity, 20, false, 12u, r + nf, 12 - nf);
 		na0 = na;
 		if (nf + na < 12)
-			na += ALERT_ScanBitsEx(adcBits, adcN, cfg.polarity, 20, true, r + nf + na, 12 - nf - na);
+			na += ALERT_ScanBitsGated(adcBits, adcN, cfg.polarity, 20, true, 12u, r + nf + na, 12 - nf - na);
 	}
 	stats.inv += (uint16_t)((nf - nf0) + (na - na0));
 
@@ -1136,7 +1220,7 @@ static void BurstFinish(void)
 		DbgSend(lb);
 	}
 	if (cfg.bitrev)
-		BitReverse(len);
+		BitReverse(pre, len);
 	for (uint16_t off = 0; off < len; off += 64u)
 		EmitH(off, (uint16_t)((len - off) < 64u ? (len - off) : 64u));
 	lastCapLen = (uint16_t)n;
@@ -1270,6 +1354,7 @@ static void StreamBegin(uint16_t xorMask, bool prefix, char pn)
 	wordXor   = xorMask;
 	streaming = true;
 	capLen    = 0;
+	capPre    = prefix ? ((cur.r59 & ARR_59_S4) ? 4u : 2u) : 0u;
 	syncWords = 0;
 	if (prefix) {
 		// The sync pattern goes in first, so an edge sync keeps its start bit
@@ -1333,17 +1418,21 @@ static void ArrPoll(void)
 	// squelch state straight from the chip: REG_0C<1> 1 = open
 	sqOpen = (BK4819_ReadRegister(BK4819_REG_0C) & 2u) != 0;
 	if (sqOpen && !sqPrev) {
-		if (draining)
+		if (draining) {
 			draining = false;        // a flicker inside one burst, not a new one
-		else
+		} else {
 			BurstOpen();
+			if (blocked)
+				burstTainted = true; // opened while the loop was stuck elsewhere
+		}
 	} else if (!sqOpen && sqPrev) {
 		// Keep reading the FIFO for DRAIN_MS, then finish. Never wait for
 		// RX_FINISHED: ta1js found it often never fires once the carrier drops.
 		draining = true;
 		lostMs   = nowMs;
 	}
-	sqPrev = sqOpen;
+	sqPrev  = sqOpen;
+	blocked = false;                 // anything blocking from here on marks it again
 	if (sqOpen && rssiDbm > burstPeak)
 		burstPeak = rssiDbm;
 
@@ -1419,6 +1508,7 @@ static void RunCensus(void)
 	}
 	confN = confOk = 0;
 	ArrArm();                        // the census reprogrammed the BK4819
+	blocked = true;                  // (ArrArm says so too; the census is the long part)
 	redraw = true;
 }
 
@@ -1501,14 +1591,26 @@ bool ALERT_HostPokeList(const uint8_t *payload, uint16_t len)
 	const uint8_t n = payload[0];
 	if (n > POKE_N || len < 1u + 5u * n)
 		return false;
-	for (uint8_t i = 0; i < n; i++)
-		if (payload[1u + 5u * i] > 0x7Fu)
+	// Nothing else in this app can key the transmitter, and these are re-applied
+	// after every arm for the rest of the power-up, silently, with PTT ignored:
+	// REG_30 (TX enable, PA gain), REG_33 (BK GPIO1 is the PA enable) and REG_36
+	// (PA bias) are refused outright. A raw write (0x0602) is still there for
+	// anyone who means it.
+	for (uint8_t i = 0; i < n; i++) {
+		const uint8_t reg = payload[1u + 5u * i];
+		if (reg > 0x7Fu || reg == 0x30u || reg == 0x33u || reg == 0x36u)
 			return false;
+	}
 	for (uint8_t i = 0; i < n; i++) {
 		const uint8_t *e = payload + 1u + 5u * i;
 		pokes[i].reg     = e[0];
 		pokes[i].andMask = Le16(e + 1);
 		pokes[i].orMask  = Le16(e + 3);
+		if (e[0] == 0x59u) {
+			// REG_59<11> is FSK TX enable: forced clear, as ARR_SET masks it
+			pokes[i].andMask &= (uint16_t)~0x0800u;
+			pokes[i].orMask  &= (uint16_t)~0x0800u;
+		}
 	}
 	pokeN = n;
 	if (running)
@@ -1521,6 +1623,11 @@ bool ALERT_HostSweepCtl(const uint8_t *payload, uint16_t len)
 	if (!payload || len < 3u)
 		return false;
 	const uint8_t op = payload[0], a = payload[1], b = payload[2];
+	// Everything but ENTER and REBOOT acts on a running sweep. Outside the app
+	// it would sit in the queue, be acked as done, and then run after the
+	// census of some later entry, long after anyone expected it.
+	if (!running && op != OP_ENTER && op != OP_REBOOT)
+		return false;
 	switch (op) {
 		case OP_STOP: case OP_CLEAR: case OP_DWELL: case OP_CENSUS:
 			break;
@@ -1542,8 +1649,13 @@ bool ALERT_HostSweepCtl(const uint8_t *payload, uint16_t len)
 				gRequestAlertApp = true;
 			return true;
 		case OP_REBOOT:
-			if (!running)
-				NVIC_SystemReset();  // no burst to protect outside the app
+			if (!running) {
+				// No burst to protect outside the app, so at once - but acked
+				// first, since uart.c's ack would come after the reset. The tag
+				// is the one uart.c uses for 0x0A02.
+				DFU_EmitAck("a02", true);
+				DFU_SafeReset();     // TX off first: PTT may be held right now
+			}
 			break;
 		default:
 			return false;
@@ -1581,7 +1693,7 @@ static void HostService(void)
 			break;
 		case OP_DWELL:  dwellSet = a ? a : 1u; break;
 		case OP_CENSUS: censusReq = true; break;
-		case OP_REBOOT: NVIC_SystemReset(); break;
+		case OP_REBOOT: DFU_SafeReset(); break;
 		case OP_RELOAD: SetArr(curIdx, curVar); break;   // new recipe or pokes: arm again
 		default: break;
 	}
@@ -2155,6 +2267,7 @@ void APP_RunAlert(void)
 	dwellQ = 0; dwellPre = 0; prodFail = 0;
 	adcState = ADCST_UNTESTED; adcRunning = false; confN = 0; confOk = 0;
 	curIdx = ARR_NONE; curVar = 0; curSlot = 0;
+	hqN = 0; blocked = false;
 
 	DFU_WatchdogArm(true);
 

@@ -110,11 +110,22 @@ static struct {
 	uint8_t  chan;                  // scan index being demodulated
 	bool     first;
 	bool     on;
+	uint16_t skip;                  // samples still to ignore (amplifier settling)
 	uint8_t  buf[DEMOD_BYTES];
 } dm;
 
+// When a burst has to switch the audio amplifier on (PA8) the pin sees its
+// turn-on step and pop first; the census never measures that, since each of its
+// PA8-on groups waits before sampling. So the demodulator ignores this much
+// and seeds its DC tracker after it: 20 ms, six bits of a ~60-bit preamble.
+#define PA8_SETTLE_SAMPLES (ADC_FS / 50u)
+
 static inline void DemodSample(int32_t raw)
 {
+	if (dm.skip) {
+		dm.skip--;
+		return;
+	}
 	if (dm.first) {
 		dm.first  = false;
 		dm.dc_x16 = raw << 4;
@@ -122,10 +133,17 @@ static inline void DemodSample(int32_t raw)
 
 	// DC removal (slow tracker) and scaling to ~8 bits
 	dm.dc_x16 += ((raw << 4) - dm.dc_x16) >> 7;
-	const int32_t x = (raw - (dm.dc_x16 >> 4)) >> 3;
+	int32_t x = (raw - (dm.dc_x16 >> 4)) >> 3;
 
-	// two quadrature correlators with a sliding window. |x| <= 256, so the
-	// int16 products cannot wrap (256 * 127 = 32512).
+	// two quadrature correlators with a sliding window, in int16. A 12-bit
+	// sample can sit up to 4095 counts off the tracker (a step the ~13 ms DC
+	// tracker has not caught up with yet), which would make |x| 511 and wrap
+	// the products; clamped, 256 * 127 = 32512 fits. tools/alert/simdemod.py
+	// clamps the same way.
+	if (x > 255)
+		x = 255;
+	else if (x < -256)
+		x = -256;
 	const int16_t p1c = (int16_t)(x * cos256(dm.ph1)), p1s = (int16_t)(x * sin256(dm.ph1));
 	const int16_t p2c = (int16_t)(x * cos256(dm.ph2)), p2s = (int16_t)(x * sin256(dm.ph2));
 	dm.ph1 = (uint8_t)(dm.ph1 + MARK_INC);
@@ -775,7 +793,9 @@ bool ALERTADC_Census(AlertAdcEmit_t emit)
 // bursts
 
 static bool burstPa8Was;
+static bool burstPa8Forced;   // BurstStart switched PA8 on; only that is undone
 static bool burstOpen;
+static bool lastPa;           // PA8 during the last burst, for LastBurstEnergy
 
 void ALERTADC_BurstStart(void)
 {
@@ -785,13 +805,15 @@ void ALERTADC_BurstStart(void)
 	// Normally already on since the census; this only matters after a
 	// Shutdown that the caller did not follow with a census or SetChoice.
 	Pa4Dac(choicePin == ALERTADC_PIN_PA4B);
-	burstPa8Was = Pa8IsOn();
-	if (choicePa8)
+	burstPa8Was    = Pa8IsOn();
+	burstPa8Forced = choicePa8 && !burstPa8Was;
+	if (burstPa8Forced)
 		Pa8Set(true);
 
 	memset(&dm, 0, sizeof(dm));
 	dm.chan  = (choicePin == ALERTADC_PIN_PB1) ? 1u : 0u;
 	dm.first = true;
+	dm.skip  = burstPa8Forced ? PA8_SETTLE_SAMPLES : 0u;
 	dm.on    = true;
 
 	AccArm(BURST_BLOCKS);
@@ -816,7 +838,12 @@ uint16_t ALERTADC_BurstStop(uint8_t *buf, uint16_t maxbits)
 	const bool     pa     = Pa8IsOn();
 	for (uint32_t c = 0; c < NCH; c++)
 		Measure(c, blocks, &lv[c]);
-	Pa8Set(burstPa8Was);
+	// Undo only what BurstStart did: the caller may have switched PA8 itself
+	// (MONITOR) while the burst was open, and that must stand.
+	if (burstPa8Forced)
+		Pa8Set(false);
+	burstPa8Forced = false;
+	lastPa = pa;
 
 	const uint32_t cc = (choicePin == ALERTADC_PIN_PB1) ? 1u : 0u;
 	lastG13 = lv[cc].g[G13];
@@ -842,8 +869,11 @@ void ALERTADC_LastBurstEnergy(int16_t *g13, int16_t *g21, int16_t *idle)
 	if (g21)
 		*g21 = lastG21;
 	if (idle)
+		// against the census idle for the PA8 state the burst was actually
+		// measured in (MONITOR may hold it on when the choice did not need it),
+		// the same (pin, bias, pa) key the P src=BURST line reports
 		*idle = (choicePin == ALERTADC_PIN_NONE) ? ALERTADC_LEVEL_NONE
-		                                         : idleTab[choicePin - 1u][choicePa8 ? 1 : 0];
+		                                         : idleTab[choicePin - 1u][lastPa ? 1 : 0];
 }
 
 void ALERTADC_Shutdown(void)
@@ -853,7 +883,9 @@ void ALERTADC_Shutdown(void)
 	SamplerStop();   // restores the ADC itself when it was running
 	if (burstOpen) {
 		burstOpen = false;
-		Pa8Set(burstPa8Was);
+		if (burstPa8Forced)
+			Pa8Set(false);
+		burstPa8Forced = false;
 	}
 	dm.on    = false;
 	accState = ACC_IDLE;

@@ -44,6 +44,9 @@
 #endif
 
 #include "app/app.h"
+#ifdef ENABLE_ALERT
+    #include "app/dfu.h"
+#endif
 #include "app/dtmf.h"
 
 #include "driver/backlight.h"
@@ -97,6 +100,18 @@ void Main(void)
     gDTMF_String[sizeof(gDTMF_String) - 1] = 0;
 
     BK4819_Init();
+
+#ifdef ENABLE_ALERT
+    // Reset-loop heal (tools/alert/X1_PLAN.md section 7): at 5 consecutive
+    // abnormal resets, go to DFU. Here rather than after the 5 s boot window,
+    // because the build most likely to need it is one that crashes during init
+    // or its first seconds and never reaches the window; and not before this
+    // line, because the BK4829 keeps its TX state across a reset and has to be
+    // reachable to be un-keyed on the way into DFU. Guard-checked; returns only
+    // if the bootloader guard fails.
+    if (DFU_AutoDfuDue())
+        (void)DFU_RequestDfu();
+#endif
 
     BOARD_ADC_GetBatteryInfo(&gBatteryCurrentVoltage, &gBatteryCurrent);
 

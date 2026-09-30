@@ -867,7 +867,9 @@ void UART_HandleCommand(uint32_t Port)
             #if defined(ENABLE_OVERLAY)
                 overlay_FLASH_RebootToBootloader();
             #else
-                NVIC_SystemReset();
+                // TX off first: a reset with PTT still held lands in the
+                // bootloader's PTT-DFU, which never un-keys the BK4829.
+                DFU_SafeReset();
             #endif
             break;
 

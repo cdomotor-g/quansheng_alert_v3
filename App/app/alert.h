@@ -73,7 +73,9 @@ void ALERT_StoreConfig(void);
 //    5 set the dwell to a qualifying bursts per arrangement per pass (0 -> 1)
 //    6 run the audio-pin census again
 //    7 enter the ALERT app (from normal mode; ignored inside it)
-//    8 reboot
+//    8 reboot (outside the app at once, acked first)
+//    Outside the app only 7 and 8 are accepted; the rest act on a running
+//    sweep and are refused rather than queued for some later entry.
 //    Arrangement indices: 0..22 the Phase 1 table, 32..39 host slots, 64..103
 //    the Phase 3 REG_58 codes. Variant byte: high nibble operation, low nibble
 //    argument - 0x1g RX gain g, 0x20 RX BW 100 (FFSK1218 only), 0x30 4-byte
@@ -84,6 +86,8 @@ void ALERT_StoreConfig(void);
 //    [0]      n, 0..8 (0 clears the list)
 //    then n x {u8 reg (0x00..0x7F), u16 and-mask, u16 or-mask}:
 //    reg = (reg & and-mask) | or-mask
+//    The transmitter's registers are refused: a list naming REG_30, REG_33 or
+//    REG_36 is rejected whole, and REG_59<11> (FSK TX enable) is forced clear.
 bool ALERT_HostArrSet(const uint8_t *payload, uint16_t len);
 bool ALERT_HostSweepCtl(const uint8_t *payload, uint16_t len);
 bool ALERT_HostPokeList(const uint8_t *payload, uint16_t len);

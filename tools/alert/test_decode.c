@@ -9,7 +9,8 @@
  * synthesiser below are integer-only copies of those in
  * tools/alert/scan_samples.py, so both build identical sample buffers, and
  * section 12 pins this scanner's output to the Python port's, which the host
- * judge runs on logged captures. */
+ * judge runs on logged captures. Section 13 covers the edge-sync windows A5/A6
+ * feed the scanner, and its argument limits. */
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -124,6 +125,31 @@ static uint32_t sample(uint8_t idle_level, uint32_t tone2_hz, int32_t ppm, uint3
 		i++;
 	}
 	return i;
+}
+
+// edge_window(): what alert.c holds after an edge sync (A5 FFFFFFF0, A6
+// FFFFFFC0): the pattern it prepends - `run` idle samples then the rest of the
+// 32 at the start level - followed by the stream from the end of the start
+// bit on. The capture has no preamble; the sync's run is all the idle there is,
+// which is why alert.c's MinIdleBits lowers the gate for these rows. sbuf must
+// hold a frame sliced with idle level 1 (the level the ring holds after either
+// sync sense). Returns the sample count in ebuf.
+static uint8_t ebuf[MAX_SAMP / 8];
+
+static uint32_t edge_window(uint32_t n, uint32_t run)
+{
+	const uint32_t nstart = 32u - run;
+	uint32_t e = 0, o = 0;
+	while (e < n && ALERT_GetBit(sbuf, e))
+		e++;
+	memset(ebuf, 0, sizeof ebuf);
+	for (; o < run; o++)
+		ebuf[o >> 3] |= (uint8_t)(0x80u >> (o & 7u));
+	o += nstart;
+	for (uint32_t i = e + nstart; i < n && o < MAX_SAMP; i++, o++)
+		if (ALERT_GetBit(sbuf, i))
+			ebuf[o >> 3] |= (uint8_t)(0x80u >> (o & 7u));
+	return o;
 }
 
 #define NOISE_NSAMP 100000u
@@ -449,6 +475,65 @@ int main(void)
 		snprintf(label, sizeof label, "lockstep noise %4u Hz: %2d readings, digest %08X",
 		         (unsigned)tone, nr, (unsigned)dig);
 		check(label, nr == LOCKSTEP[t].noise_n && dig == LOCKSTEP[t].noise_dig);
+	}
+
+	/* 13. edge-sync windows: A5 (k = 4, 28-sample run -> gate 7) and A6 (k = 6,
+	 *     26 -> gate 4) decode every clean case at their own gate and none at
+	 *     the usual 12, which their captures can never meet. Only the two
+	 *     combinations with idle level 1 occur: after a negative sync the
+	 *     words are complemented back to the programmed sense. */
+	{
+		static const struct { uint32_t tone, run; uint8_t gate; } EDGE[2] = {
+			{ 1200, 28, 7 }, { 1800, 26, 4 },
+		};
+		for (int t = 0; t < 2; t++) {
+			const uint32_t spb = ALERT_SPB_Q8(EDGE[t].tone);
+			int own = 0, std12 = 0;
+			for (int ci = 1; ci <= 2; ci++) {
+				for (int pp = 0; pp < 3; pp++) {
+					for (int pi = 0; pi < 4; pi++) {
+						uint8_t w[4];
+						if (pi & 1)
+							eif_words(6129, 1599, w);
+						else
+							abf_words(6129, 1599, w);
+						build(w, 1, COMBOS[ci].logic, 12, 0, 0);
+						const uint32_t ns = edge_window(
+							sample(1, EDGE[t].tone, PPMS[pp], PHASES[pi]), EDGE[t].run);
+						int m = ALERT_ScanSamples(ebuf, ns, spb, COMBOS[ci].pol, COMBOS[ci].inv,
+						                          EDGE[t].gate, r, 8);
+						own += m == 1 && r[0].id == 6129 && r[0].value == 1599;
+						m = ALERT_ScanSamples(ebuf, ns, spb, COMBOS[ci].pol, COMBOS[ci].inv,
+						                      12, r, 8);
+						std12 += m != 0;
+					}
+				}
+			}
+			snprintf(label, sizeof label, "ScanSamples edge sync %4u Hz: gate %u %d/24, gate 12 %d/24",
+			         (unsigned)EDGE[t].tone, (unsigned)EDGE[t].gate, own, std12);
+			check(label, own == 24 && std12 == 0);
+		}
+	}
+
+	/* 13b. limits: spb_q8 outside 256..4096 reads nothing; max_out truncates */
+	{
+		uint8_t w[8];
+		abf_words(705, 123, w);
+		eif_words(706, 456, w + 4);
+		build(w, 2, LOGIC_NEG, 60, 10, 0);
+		const uint32_t ns = sample(0, 1200, 0, 0);
+		const uint32_t spb = ALERT_SPB_Q8(1200);
+		n = ALERT_ScanSamples(sbuf, ns, spb, ALERT_POL_ANY, false, 12, r, 8);
+		check("ScanSamples two frames at k=4 -> 705 then 706",
+		      n == 2 && r[0].id == 705 && r[1].id == 706);
+		check("ScanSamples spb_q8 255 -> nothing",
+		      ALERT_ScanSamples(sbuf, ns, ALERT_SPB_Q8_MIN - 1u, ALERT_POL_ANY, false, 12, r, 8) == 0);
+		check("ScanSamples spb_q8 4097 -> nothing",
+		      ALERT_ScanSamples(sbuf, ns, ALERT_SPB_Q8_MAX + 1u, ALERT_POL_ANY, false, 12, r, 8) == 0);
+		n = ALERT_ScanSamples(sbuf, ns, spb, ALERT_POL_ANY, false, 12, r, 1);
+		check("ScanSamples max_out 1 under POL_ANY -> 705 only", n == 1 && r[0].id == 705);
+		check("ScanSamples max_out 0 -> nothing",
+		      ALERT_ScanSamples(sbuf, ns, spb, ALERT_POL_ANY, false, 12, r, 0) == 0);
 	}
 
 	printf("\n%s (%d failure%s)\n", fails ? "FAILED" : "all tests passed",

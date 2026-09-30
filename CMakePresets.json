@@ -168,6 +168,7 @@
                 "ENABLE_FEAT_F4HWN_GMRS_FRS_MURS": true,
                 "ENABLE_NOAA": true,
                 "ENABLE_FEAT_F4HWN_RESCUE_OPS": true,
+                "ENABLE_UART_RW_BK_REGS": true,
                 "EDITION_STRING": "RescueOps",
                 "TARGET": "f4hwn.rescueops"
             }

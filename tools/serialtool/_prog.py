@@ -18,22 +18,43 @@ from serial import Serial
 import msg as mm
 from datetime import datetime
 import math
+import time
 
 
 _QUIT = "quit"
 
 
+# Page programming that makes no progress for this long has failed: the
+# bootloader answers each 256-byte page within ~100 ms, and one that rejects
+# every page (err != 0, e.g. --resume without the handshake it needs) or has
+# gone silent would otherwise be retried forever.
+PROG_STALL_S = 10.0
+
+
 class Programmer:
 
-    def __init__(self, ser: Serial, fw_image: bytes, bl_ver: str, resume: bool = False):
+    def __init__(self, ser: Serial, fw_image: bytes, bl_ver: str, resume: bool = False,
+                 stall_timeout: float = 0.0):
         self._ser = ser
         self._fw_image = fw_image
         self.bl_ver = bl_ver
+        # True once the last page is acknowledged: the caller's exit status.
+        self.ok = False
+        # stall_timeout > 0: give up when no state change or page ack happens
+        # for that long, in any state (the beacon wait included). 0 leaves the
+        # beacon wait unbounded, as a manual power-on-with-PTT flash needs.
+        self._stall = stall_timeout
+        self._progress_t = time.monotonic()
         # Recovery: a bootloader left mid-flash sits in state 2 and no longer
         # beacons, so _Init would wait forever. Resending from page 0 restarts
-        # the programming without a beacon wait or a fresh handshake.
+        # the programming without a beacon wait or a fresh handshake. Only
+        # valid then: a freshly entered bootloader answers err=1 to every page
+        # until the 0x0530 handshake has been done.
         self._state = _ProgFw(self) if resume else _Init(self)
         # self._state = _Logging(self)
+
+    def progress(self):
+        self._progress_t = time.monotonic()
 
     def loop(self) -> bool:
         next = self._state.loop()
@@ -42,6 +63,16 @@ class Programmer:
 
         if next:
             self._state = next
+            self.progress()
+
+        limit = PROG_STALL_S if isinstance(self._state, _ProgFw) else 0.0
+        if self._stall > 0:
+            limit = min(limit, self._stall) if limit else self._stall
+        if limit and time.monotonic() - self._progress_t > limit:
+            print()
+            print("No progress for {:.0f} s in {}; giving up.".format(
+                limit, type(self._state).__name__.lstrip("_")))
+            return False
 
         return True
 
@@ -273,11 +304,13 @@ class _ProgFw(_State):
 
         self.page_index += 1
         self.expect_resp = False
+        self.prog.progress()
 
         if self.page_index < self.page_cnt:
             return None
 
         print("Firmware program done")
+        self.prog.ok = True
         # return _Logging(self.prog)
         return _QUIT
 

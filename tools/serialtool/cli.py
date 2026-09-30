@@ -18,6 +18,7 @@
 
 import argparse
 import signal
+import sys
 from time import sleep
 import os
 
@@ -107,26 +108,27 @@ def main_restore(args, ser):
         sleep(0)
 
 
-def main_flash(args, ser):
+def main_flash(args, ser) -> bool:
 
     import _prog as pp
 
     bl_ver: str = args.bl_ver
     fw_file: str = args.file
     resume: bool = getattr(args, "resume", False)
+    timeout: float = getattr(args, "timeout", 0.0) or 0.0
 
     try:
         fw_image = load_image(fw_file)
         if 0 == len(fw_image):
             print("Invalid firmware image: {}: empty file".format(fw_file))
-            return
+            return False
     except Exception as e:
         print("Cannot load firmware image '{}': {}".format(fw_file, e))
-        return
+        return False
 
     if len(bl_ver) > 4:
         print("Invalid bootloader version '{}': more than 4 characters".format(bl_ver))
-        return
+        return False
 
     print("Firmware image loaded: {}, size = {}".format(fw_file, len(fw_image)))
 
@@ -138,10 +140,12 @@ def main_flash(args, ser):
 
     signal.signal(signal.SIGINT, quit_handler)
 
-    prog = pp.Programmer(ser, fw_image, bl_ver, resume=resume)
+    prog = pp.Programmer(ser, fw_image, bl_ver, resume=resume, stall_timeout=timeout)
 
     while (not quit_flag) and prog.loop():
         sleep(0)
+
+    return prog.ok
 
 
 def get_raw_output_path(file: str) -> str:
@@ -230,6 +234,14 @@ def main():
         help="skip the beacon wait and handshake, resending from page 0 "
         "(recovery for a bootloader left mid-flash in state 2, which no longer beacons)",
     )
+    ap_flash.add_argument(
+        "--timeout",
+        type=float,
+        default=0.0,
+        help="give up after this many seconds without progress in any state, "
+        "the beacon wait included (default 0: wait for the radio indefinitely; "
+        "page programming always gives up after 10 s without progress)",
+    )
     ap_flash.add_argument("file", help="firmware image file")
 
     ap_dump = sp.add_parser("dump", help="dump configuration or calibration data")
@@ -282,7 +294,7 @@ def main():
 
     if "decode" == sub_name:
         main_decode(args)
-        return
+        return 0
 
     port: str = args.port
 
@@ -292,11 +304,14 @@ def main():
         ser = serial.Serial(port, baudrate=38400, timeout=0.0001, write_timeout=None)
     except Exception as e:
         print("Cannot open port '{}': {}".format(port, e))
-        return
+        return 1
 
+    # The exit status is what tools/hotflash.py goes by: non-zero unless the
+    # last page was acknowledged.
+    rc = 0
     match sub_name:
         case "flash":
-            main_flash(args, ser)
+            rc = 0 if main_flash(args, ser) else 1
         case "dump":
             main_dump(args, ser)
         case "restore":
@@ -304,7 +319,8 @@ def main():
 
     ser.close()
     print("Quit")
+    return rc
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
