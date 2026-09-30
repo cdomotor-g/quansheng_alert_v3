@@ -17,3 +17,6 @@ __pycache__/
 
 .DS_Store
 AGENTS.md
+
+# hotflash.py artifact downloads
+tools/_hotflash_dl/
