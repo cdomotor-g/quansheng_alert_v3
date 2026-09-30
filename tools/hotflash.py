@@ -121,11 +121,17 @@ def send_cmd(ser, cmd_id, payload=b""):
 def read_lines(ser, seconds, match=None):
     """Collect CRLF-terminated ASCII lines for up to `seconds`. If `match` is a
     compiled regex, return early as soon as a line matches it."""
+    import serial
     end = time.time() + seconds
     buf = bytearray()
     lines = []
     while time.time() < end:
-        data = ser.read(256)
+        try:
+            data = ser.read(256)
+        except serial.SerialException:
+            # The radio reset and its CDC port vanished (0x05E0 does this, often
+            # before the K line is out); callers treat "no reply" as "maybe reset".
+            break
         if not data:
             time.sleep(0.01)
             continue
