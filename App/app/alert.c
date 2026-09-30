@@ -1214,7 +1214,10 @@ static void BurstFinish(void)
 		if (burstSrc == SRC_PRE) Inc(&dwellPre);
 		bool done;
 		if (stream)              done = dwellPre >= 2u || dwellQ >= 6u;
-		else if (phase == PH_2)  done = dwellQ >= P2_BURSTS;
+		// Phase 3 runs once, so it takes its two bursts in one visit: the
+		// "FSK route dead" verdict (plan section 9) needs two on every row.
+		else if (phase == PH_2 || phase == PH_3)
+		                         done = dwellQ >= P2_BURSTS;
 		else                     done = dwellQ >= dwellSet;
 		// A table decode buys more bursts: adoption needs three, and at one
 		// burst per pass collecting them would take three whole passes.

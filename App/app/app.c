@@ -1611,6 +1611,10 @@ void CheckKeys(void)
 }
 
 #ifdef ENABLE_ALERT
+#ifdef ENABLE_USB
+extern volatile uint8_t dtr_enable;   // App/usb/usbd_cdc_if.c: host has the port open
+#endif
+
 // ALERT-X1 boot policy (plan sections 2 and 7). Runs from the 10 ms slice while
 // the radio is still in normal mode. It prints the boot 'B' line once, holds a
 // 5 s window in which USB commands (including DFU) are serviced, then decides:
@@ -1627,12 +1631,25 @@ static void AlertBootTask(void)
     if (decided)
         return;
 
+    ++ticks;
+
+    // USB output is dropped until the host asserts DTR, and at tick 0 the port
+    // has not even enumerated, so a line sent then never reaches the host that
+    // reopens the port after a reset (hotflash.py, radio.py reboot --wait).
+    // Hold it until DTR is up, or until the window closes for a UART listener.
     if (!announced) {
-        DFU_EmitBootLine();
-        announced = true;
+#ifdef ENABLE_USB
+        const bool ready = dtr_enable || ticks >= 500;
+#else
+        const bool ready = true;
+#endif
+        if (ready) {
+            DFU_EmitBootLine();
+            announced = true;
+        }
     }
 
-    if (++ticks < 500)          // 5 s
+    if (ticks < 500)            // 5 s
         return;
 
     decided = true;

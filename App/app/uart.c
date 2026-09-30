@@ -48,6 +48,8 @@
 #include "app/dfu.h"
 #ifdef ENABLE_ALERT
     #include "app/alert.h"
+    #include "app/alert_adc.h"
+    #include "helper/battery.h"
 #endif
 
 #if defined(ENABLE_OVERLAY)
@@ -503,6 +505,18 @@ static void CMD_0529(uint32_t Port)
 
     Reply.Header.ID   = 0x52A;
     Reply.Header.Size = sizeof(Reply.Data);
+
+#ifdef ENABLE_ALERT
+    // While the ALERT sampler has TIM3 triggering the ADC, a software start
+    // never raises EOS, so a live read would spin until the soft watchdog
+    // reset the radio mid-burst. Report the last reading taken instead.
+    if (ALERTADC_IsSampling()) {
+        Reply.Data.Voltage = gBatteryCurrentVoltage;
+        Reply.Data.Current = 0;
+        SendReply(Port, &Reply, sizeof(Reply));
+        return;
+    }
+#endif
 
     // Original doesn't actually send current!
     BOARD_ADC_GetBatteryInfo(&Reply.Data.Voltage, &Reply.Data.Current);
