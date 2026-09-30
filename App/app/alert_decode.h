@@ -38,6 +38,8 @@ typedef struct {
 	uint8_t  format;    // ALERT_FMT_*
 	uint8_t  polarity;  // ALERT_POL_* (async formats only)
 	uint16_t bit_pos;   // bit offset of the frame's first start bit in the scanned buffer
+	uint32_t payload;   // the 32 data bits that decoded (ALERT_DecodePayload32's input;
+	                    // for A2C the record's four bytes, first in the top byte)
 } AlertReading_t;
 
 // Bit accessor: bit n of a buffer, MSB of byte 0 first (the order the BK4819

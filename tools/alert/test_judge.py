@@ -26,6 +26,10 @@ and the discriminator noise the window carries after squelch-lost.
   framing    radio.py's frames parsed the way uart.c parses them, and its
              demultiplexer on a reply packet mixed into the line stream
 
+The judge only reads logs, and the X1 sweep that wrote them is gone from the
+firmware (V2), so these scenarios now keep it honest for old logs. The sweep's
+host commands went with it; the relay test uses 0x05E1 DFU_CHECK instead.
+
     python tools/alert/test_judge.py
 """
 import contextlib
@@ -369,12 +373,8 @@ def fw_reply(msg_id, data):
 
 def check_framing(check):
     cases = [
-        (radio.CMD_SWEEP_CTL, radio.body_sweep_ctl(radio.SWEEP_OPS['enter'])),
-        (radio.CMD_SWEEP_CTL, radio.body_sweep_ctl(radio.SWEEP_OPS['goto'], 19)),
-        (radio.CMD_ARR_SET, radio.body_arr_set(32, {'r58': 0x3FC3, 't2': 1300})),
-        (radio.CMD_ARR_SET, radio.body_arr_set(39, {'tag': 'Q7', 'r59': 0x0408, 'flags': 1})),
-        (radio.CMD_POKE_LIST, radio.body_poke_list([(0x59, 0xFFF0, 0x0006), (0x5C, 0, 0xAA30)])),
-        (radio.CMD_POKE_LIST, radio.body_poke_list([])),
+        (radio.CMD_DFU_CHECK, b''),
+        (0x05E0, bytes(range(8))),
         (radio.CMD_BK_READ, bytes([0x58])),
         (radio.CMD_BK_WRITE, bytes([0x72, 0x65, 0x30])),
         (radio.CMD_REBOOT, b''),
@@ -386,19 +386,6 @@ def check_framing(check):
         except AssertionError as e:
             ok, got = False, str(e)
         check('frame %04X body %s parses as uart.c would' % (msg_id, body.hex() or '-'), ok, got)
-    check('SWEEP_CTL enter is op 7', radio.body_sweep_ctl(radio.SWEEP_OPS['enter'])[0] == 7)
-
-    # ARR_SET read back at the offsets ALERT_HostArrSet uses (alert.h)
-    b = radio.body_arr_set(33, {'tag': 'X9', 'r58': 0x03C5, 'r70': 0x80E0, 't1': 2100,
-                                't2': 1042, 'r5c': 0xAA30, 'r59': 0x0408, 'r5a': 0xFFFF,
-                                'r5b': 0xFFF0, 'flags': 1})
-
-    def le(o):
-        return b[o] | (b[o + 1] << 8)
-    check('ARR_SET is 21 bytes at the offsets alert.h gives',
-          len(b) == 21 and b[0] == 33 and b[1:4] == b'X9' + bytes(1) and le(4) == 0x03C5 and
-          le(6) == 0x80E0 and le(8) == 2100 and le(10) == 1042 and le(12) == 0xAA30 and
-          le(14) == 0x0408 and le(16) == 0xFFFF and le(18) == 0xFFF0 and b[20] == 1, b.hex())
 
     stream = (b'D I1 S0 F0\r\nL 0 A1 r58=3FC3\r\n' + fw_reply(0x0601, bytes([0x58, 0xC3, 0x3F])) +
               b'K arr ok\r\nD I2')
@@ -475,8 +462,8 @@ def check_relay(check, td):
             saved = radio.RELAY_ADDR
             radio.RELAY_ADDR = srv.getsockname()
             rc = []
-            cli = argparse.Namespace(direct=False, port=None, verbose=False, op='goto', a=19, b=0)
-            th = threading.Thread(target=lambda: rc.append(radio.cmd_sweep_ctl(cli)))
+            cli = argparse.Namespace(direct=False, port=None, verbose=False)
+            th = threading.Thread(target=lambda: rc.append(radio.cmd_dfu_check(cli)))
             th.start()
             import time
             end = time.time() + 5
@@ -494,8 +481,8 @@ def check_relay(check, td):
             logged = f.read()
         check('relay (K ok=%d): exit %d, frame reached the port, both ends logged'
               % (ok, 1 - ok),
-              rc == [1 - ok] and uart_parse(sent) == (radio.CMD_SWEEP_CTL, bytes([2, 19, 0])) and
-              '#tx ' in logged and 'K 0A02 ok=%d' % ok in logged, (rc, sent.hex(), logged))
+              rc == [1 - ok] and uart_parse(sent) == (radio.CMD_DFU_CHECK, b'') and
+              '#tx ' in logged and 'K 05E1 ok=%d' % ok in logged, (rc, sent.hex(), logged))
 
 
 def check_chance_logic(check):

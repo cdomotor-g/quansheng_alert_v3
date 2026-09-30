@@ -16,7 +16,12 @@
 #ifndef _SCHEDULER_H
 #define _SCHEDULER_H
 
+#include <stdint.h>
+
 #include "py32f0xx.h"
+
+// SysTick interrupts since boot: 10 ms each, so it wraps after 497 days.
+uint32_t SCHEDULER_Ticks10ms(void);
 
 static void inline SCHEDULER_Enable()
 {

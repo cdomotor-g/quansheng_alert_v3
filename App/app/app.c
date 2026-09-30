@@ -45,6 +45,7 @@
 #include "app/scanner.h"
 #ifdef ENABLE_ALERT
 #include "app/alert.h"
+#include "app/alert_console.h"
 #endif
 #include "app/dfu.h"
 #if defined(ENABLE_UART) || defined(ENABLE_USB)
@@ -1619,7 +1620,7 @@ extern volatile uint8_t dtr_enable;   // App/usb/usbd_cdc_if.c: host has the por
 // the radio is still in normal mode. It prints the boot 'B' line once, holds a
 // 5 s window in which USB commands (including DFU) are serviced, then decides:
 //   - >= 3 abnormal resets: stay in normal mode so a host can intervene;
-//   - otherwise: autostart the ALERT sweep, unless the app already ran.
+//   - otherwise: autostart the ALERT receiver, unless the app already ran.
 // The >= 5 heal into DFU is not here: Main() checks it as soon as the BK4829
 // is initialised, so a build that crashes in its first seconds still heals.
 // The 60 s "healthy" clear of the abnormal-reset counter is done in SysTick.
@@ -1654,7 +1655,7 @@ static void AlertBootTask(void)
     if (decided)
         return;
 
-    // Entered already (menu, key action, SWEEP_CTL op 7): APP_RunAlert blocks
+    // Entered already (menu, key action): APP_RunAlert blocks
     // this task, so the countdown would otherwise resume after the user left
     // the app and start it again behind their back.
     if (DFU_AppEntered()) {
@@ -1678,6 +1679,8 @@ void APP_TimeSlice10ms(void)
 
 #ifdef ENABLE_ALERT
     AlertBootTask();
+    // the ALERT console answers in normal operation too (V2_SPEC section 7)
+    ALERTCON_Poll();
 #endif
 
     SETTINGS_SaveVfoIndicesFlush();

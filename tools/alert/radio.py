@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Log the ALERT-X1 build's USB-C stream, and send it the X1 host commands.
+"""Log the ALERT build's USB-C stream, and send it binary protocol commands.
 
 The radio's USB-C port is a CDC ACM device, VID 0x36B7 (App/usb/usbd_cdc_if.c;
 the stock bootloader uses the same VID). The firmware only sends while the host
@@ -8,17 +8,14 @@ silent until the host asserts DTR again. So the logger re-asserts DTR after 10 s
 without a byte, which is what turned several past sessions into empty logs.
 
     python tools/alert/radio.py log [--minutes N]        # tools/alert/logs/x1-*.log
-    python tools/alert/radio.py sweep-ctl goto 5         # 0x0A02 SWEEP_CTL
-    python tools/alert/radio.py sweep-ctl goto 0 0x40    # A1, variant: REG_59 invert
-    python tools/alert/radio.py sweep-ctl start 1
-    python tools/alert/radio.py arr-set 32 --r58 0x3FC3 --t2 1300 --r70 0x80E0 --t1 2100
-    python tools/alert/radio.py sweep-ctl goto 32        # arm what arr-set loaded
-    python tools/alert/radio.py poke 0x59:0xFFF0:0x0006    # 0x0A03 POKE_LIST
-    python tools/alert/radio.py poke                       # empty list: clear
-    python tools/alert/radio.py bk-read 0x58 0x5C 0x0B     # 0x0601
-    python tools/alert/radio.py bk-write 0x72 0x3065       # 0x0602
-    python tools/alert/radio.py reboot [--wait]            # 0x05DD
-    python tools/alert/radio.py send 0x0A02 070000         # any ID, raw body
+    python tools/alert/radio.py bk-read 0x58 0x5C 0x0B   # 0x0601
+    python tools/alert/radio.py bk-write 0x72 0x3065     # 0x0602
+    python tools/alert/radio.py dfu-check                # 0x05E1: the bootloader guard
+    python tools/alert/radio.py reboot [--wait]          # 0x05DD
+    python tools/alert/radio.py send 0x0514 00000000     # any ID, raw body
+
+The X1 sweep commands (0x0A01 ARR_SET, 0x0A02 SWEEP_CTL, 0x0A03 POKE_LIST)
+went with the FSK sweep in V2; the firmware ignores those IDs now.
 
 Windows lets one process hold a COM port. While `log` runs it owns the port,
 so the other subcommands hand their frame to it over 127.0.0.1 and it sends
@@ -53,83 +50,13 @@ SILENCE_S = 10.0                    # re-assert DTR after this long without a by
 BOOTLOADER_BACKOFF_S = 90.0         # leave the port to the flasher (hotflash.py)
 
 CMD_REBOOT = 0x05DD
+CMD_DFU_CHECK = 0x05E1
 CMD_BK_READ = 0x0601
 CMD_BK_WRITE = 0x0602
-CMD_ARR_SET = 0x0A01
-CMD_SWEEP_CTL = 0x0A02
-CMD_POKE_LIST = 0x0A03
 
 # bootloader beacons: seeing one means the radio is in DFU, and the port
 # belongs to whoever is flashing it
 BOOTLOADER_IDS = (msg.MSG_NOTIFY_DEV_INFO, msg.MSG_NOTIFY_BL_VER)
-
-# ---------------------------------------------------------------------------
-# Payload layouts: the comment above ALERT_HostArrSet in App/app/alert.h is
-# the authority, and these follow it. Little-endian. A body the firmware
-# cannot use gets "K a0N ok=0"; `send` covers any later change on the bench
-# without editing this file.
-
-# SWEEP_CTL {u8 op, u8 a, u8 b}
-SWEEP_OPS = {
-    'stop': 0,      # stop sweeping, hold the current arrangement
-    'start': 1,     # a = phase 1, 2 or 3, from its first entry
-    'goto': 2,      # a = arrangement, b = variant byte
-    'adopt': 3,     # a = arrangement, b = variant: adopt and persist;
-                    # a = 0xFE adopts the ADC route, 0xFF clears the adoption
-    'clear': 4,     # clear all scores and repeat counts
-    'dwell': 5,     # a = qualifying bursts per arrangement per pass
-    'census': 6,    # run the audio-pin census again
-    'enter': 7,     # from normal mode: start the ALERT app
-    'reboot': 8,
-}
-# Arrangement indices: 0..22 Phase 1, 32..39 host slots, 64..103 Phase 3.
-# Variant byte: 0x1g RX gain g, 0x20 RX BW 100, 0x30 4-byte sync, 0x40 invert,
-# 0x5p preamble p, 0x60 REG_59<8>, 0x7n REG_59<2:0> = n, 0x00 none.
-
-# ARR_SET, 21 bytes: slot 32..39, then the recipe
-ARR_LAYOUT = (
-    ('tag', '3s'),      # up to 3 printable characters, NUL padded ("H<n>" if empty)
-    ('r58', 'H'),       # REG_58, RX gain in <9:8>
-    ('r70', 'H'),       # <15> set: TONE1 is written too (0x80E0), else 0x00E0
-    ('t1', 'H'),        # TONE1 Hz, 0..3000
-    ('t2', 'H'),        # TONE2 Hz, 1..3000: the sample clock; 0 empties the slot
-    ('r5c', 'H'),
-    ('r59', 'H'),       # <10> invert, <8>, <7:4> preamble, <3> 4-byte sync, <2:0>
-    ('r5a', 'H'),       # sync bytes 0, 1
-    ('r5b', 'H'),       # sync bytes 2, 3 (used with REG_59<3>)
-    ('flags', 'B'),     # <0> stream policy (as S1/S2)
-)
-ARR_DEFAULTS = {'tag': b'', 'r58': 0x3FC3, 'r70': 0x00E0, 't1': 0, 't2': 1200,
-                'r5c': 0x5625, 'r59': 0x0000, 'r5a': 0xFFFF, 'r5b': 0x0000, 'flags': 0}
-ARR_SLOTS = range(32, 40)
-
-# POKE_LIST {u8 n, n x {u8 reg, u16 and, u16 or}}; n 0 clears; reg = reg & and | or
-POKE_MAX = 8
-
-
-def body_sweep_ctl(op, a=0, b=0):
-    return struct.pack('<BBB', op, a, b)
-
-
-def body_arr_set(slot, fields):
-    vals = dict(ARR_DEFAULTS)
-    vals.update({k: v for k, v in fields.items() if v is not None})
-    if isinstance(vals['tag'], str):
-        vals['tag'] = vals['tag'].encode('ascii')
-    body = struct.pack('<B', slot)
-    for name, fmt in ARR_LAYOUT:
-        body += struct.pack('<' + fmt, vals[name])
-    return body
-
-
-def body_poke_list(entries):
-    if len(entries) > POKE_MAX:
-        raise ValueError('at most %d pokes' % POKE_MAX)
-    body = struct.pack('<B', len(entries))
-    for reg, and_mask, or_mask in entries:
-        body += struct.pack('<BHH', reg, and_mask, or_mask)
-    return body
-
 
 def frame(msg_id, body=b''):
     """One host-to-radio packet: AB CD | len | ID len body | CRC | DC BA."""
@@ -521,12 +448,11 @@ def ack_command(args, msg_id, body, wait=3.0):
     show(items, args.verbose)
     acks = [i[1] for i in items if is_ack(i)]
     if not acks:
-        print('no K line within %.0f s: is this the X1 build, with the ALERT app running?'
-              % wait)
+        print('no K line within %.0f s: is this an ALERT build?' % wait)
         return 1
-    if 'ok=0' in acks[-1].split():
-        # the firmware answers "K <tag> ok=0" to a body it cannot parse
-        print('refused: check the payload layout against ALERT_Host* in alert.c')
+    if 'ok=1' not in acks[-1].split():
+        # "K <tag> ... ok=0": refused, or (dfu-check) the guard failed
+        print('the radio answered ok=0')
         return 1
     return 0
 
@@ -538,40 +464,10 @@ def num(s):
     return int(s, 0)
 
 
-def cmd_sweep_ctl(args):
-    op = SWEEP_OPS.get(args.op)
-    if op is None:
-        op = num(args.op)
-    return ack_command(args, CMD_SWEEP_CTL, body_sweep_ctl(op, args.a, args.b))
-
-
-def cmd_arr_set(args):
-    if args.slot not in ARR_SLOTS:
-        print('slot must be 32..39 (the RAM slots)')
-        return 2
-    if args.raw:
-        body = struct.pack('<B', args.slot) + bytes.fromhex(args.raw)
-    else:
-        r59 = args.r59
-        if r59 is None:
-            # the same REG_59 fields the Phase 2 variants vary
-            r59 = (int(args.inv) << 10) | ((args.pre or 0) << 4) | (int(args.s4) << 3)
-        body = body_arr_set(args.slot, {'tag': args.tag, 'r58': args.r58, 'r70': args.r70,
-                                        't1': args.t1, 't2': args.t2, 'r5c': args.r5c,
-                                        'r59': r59, 'r5a': args.r5a, 'r5b': args.r5b,
-                                        'flags': int(args.stream)})
-    return ack_command(args, CMD_ARR_SET, body)
-
-
-def cmd_poke(args):
-    entries = []
-    for spec in args.pokes:
-        parts = spec.split(':')
-        if len(parts) != 3:
-            print('poke is REG:AND:OR, e.g. 0x59:0xFFF0:0x0006')
-            return 2
-        entries.append(tuple(num(p) for p in parts))
-    return ack_command(args, CMD_POKE_LIST, body_poke_list(entries))
+def cmd_dfu_check(args):
+    # dfu.c answers "K bl crc=<crc32> ver=<bootloader> ok=<0|1> fw=<hash>":
+    # ok=1 means hotflash.py may take this radio into the stock DFU
+    return ack_command(args, CMD_DFU_CHECK, b'')
 
 
 def cmd_bk_read(args):
@@ -661,30 +557,6 @@ def main(argv=None):
     p.add_argument('--no-d', action='store_true', help='log D heartbeats but do not echo them')
     p.set_defaults(fn=cmd_log)
 
-    p = sub.add_parser('sweep-ctl', help='0x0A02: ' + ' '.join(SWEEP_OPS))
-    p.add_argument('op', help='|'.join(SWEEP_OPS) + ' or a number')
-    p.add_argument('a', nargs='?', type=num, default=0)
-    p.add_argument('b', nargs='?', type=num, default=0)
-    p.set_defaults(fn=cmd_sweep_ctl)
-
-    p = sub.add_parser('arr-set', help='0x0A01: write a RAM arrangement slot (32-39)')
-    p.add_argument('slot', type=num)
-    p.add_argument('--tag', help='up to 3 characters for the L line (default H<n>)')
-    for name in ('r58', 'r70', 't1', 't2', 'r5c', 'r5a', 'r5b'):
-        p.add_argument('--' + name, type=num, help='default %s' % (
-            ARR_DEFAULTS[name] if name in ('t1', 't2') else '0x%04X' % ARR_DEFAULTS[name]))
-    p.add_argument('--r59', type=num, help='REG_59 base, raw (overrides --inv/--pre/--s4)')
-    p.add_argument('--inv', action='store_true', help='REG_59<10> invert')
-    p.add_argument('--pre', type=num, help='REG_59<7:4> preamble nibble (default 0)')
-    p.add_argument('--s4', action='store_true', help='REG_59<3>: 4-byte sync, REG_5A then REG_5B')
-    p.add_argument('--stream', action='store_true', help='stream policy (as S1/S2)')
-    p.add_argument('--raw', help='20 bytes of hex sent after the slot byte instead of the fields')
-    p.set_defaults(fn=cmd_arr_set)
-
-    p = sub.add_parser('poke', help='0x0A03: REG:AND:OR entries applied after every arm')
-    p.add_argument('pokes', nargs='*')
-    p.set_defaults(fn=cmd_poke)
-
     p = sub.add_parser('bk-read', help='0x0601: read BK4829 registers')
     p.add_argument('regs', nargs='+')
     p.set_defaults(fn=cmd_bk_read)
@@ -693,6 +565,9 @@ def main(argv=None):
     p.add_argument('reg')
     p.add_argument('value')
     p.set_defaults(fn=cmd_bk_write)
+
+    p = sub.add_parser('dfu-check', help='0x05E1: report the bootloader guard (K line)')
+    p.set_defaults(fn=cmd_dfu_check)
 
     p = sub.add_parser('reboot', help='0x05DD: NVIC_SystemReset')
     p.add_argument('--wait', action='store_true', help='wait for the B boot line')

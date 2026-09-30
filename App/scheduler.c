@@ -46,6 +46,13 @@
 
 static volatile uint32_t gGlobalSysTickCounter;
 
+// For timestamps that must not stop while a loop blocks (the ALERT records).
+// A 32-bit load is atomic on the M0+, so no masking of SysTick is needed.
+uint32_t SCHEDULER_Ticks10ms(void)
+{
+    return gGlobalSysTickCounter;
+}
+
 // we come here every 10ms
 void SysTick_Handler(void)
 {

@@ -395,11 +395,22 @@ an EEPROM poke would be overwritten. Use the menu.
 ## Heartbeat fields
 
 ```
-D I<irq> S<syncs> F<frames> G<gated> X<stuck> B<bits> R<rssi> Q<squelch>
-  N<bursts> m<mode> y<sync> v<invert> l<sync4> f<floor> p<peak> V<inverted-sense>
+D I<squelch irqs> F<frames> G<gated> B<bits> R<rssi> Q<squelch> N<bursts>
+  f<floor> p<peak> V<inverted-sense> C<squelch openings>
 ```
 
-## ALERT-X1: running the sweep and judging it
+Every 500 ms with the squelch shut. B is the bits the ADC demodulator gave for
+the last qualifying burst. The FSK fields (S syncs, X stuck streams, a
+arrangement, z pass) went with the sweep in V2.
+
+## ALERT-X1: the sweep (removed in V2) and judging its logs
+
+V2 Phase A (`V2_SPEC.md` section 1) removed the FSK sweep from the firmware:
+the arrangement table, scoring and adoption, the `L C H Y F Z G` lines and the
+0x0A01-0x0A03 host commands. The receiver is plain RX with the AF at FM and
+the ADC route decodes every burst; a census choice that has decoded is kept,
+so the census runs only on a fresh radio or when the CENSUS setting asks.
+What follows describes the X1 build, and `sweep_judge.py` still reads its logs.
 
 The plan is `X1_PLAN.md`. After the one PTT-held flash, the build needs no
 keypresses. The ALERT app starts 5 s after boot, runs the audio-pin census, and
@@ -422,9 +433,8 @@ While the logger runs, the other subcommands pass their frame to it over
 localhost, because Windows lets only one process open a COM port:
 
 ```bash
-python tools/alert/radio.py sweep-ctl goto 19    # stop|start|goto|adopt|clear|dwell|census|enter|reboot
 python tools/alert/radio.py bk-read 0x58 0x59 0x5C
-python tools/alert/radio.py poke 0x59:0xFFF0:0x0006
+python tools/alert/radio.py dfu-check            # the K bl line: may hotflash.py proceed?
 python tools/alert/radio.py reboot --wait        # prints the B line
 ```
 
@@ -452,6 +462,4 @@ window. The window carries up to 140 ms of discriminator noise on either side
 of the burst, which would sink a perfect capture. `python tools/alert/test_judge.py`
 checks all of this on fabricated logs.
 
-The `ARR_SET`, `SWEEP_CTL` and `POKE_LIST` payload layouts are defined in
-`radio.py` and must match the comment on `ALERT_Host*` in `alert.c`. A `K ... ok=0`
-reply means they do not. `radio.py send <id> <hex>` sends any body as-is.
+`radio.py send <id> <hex>` sends any body as-is.

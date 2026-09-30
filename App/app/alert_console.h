@@ -1,0 +1,18 @@
+/* ALERT receiver: a line-based text console on the USB CDC port.
+ *
+ * Commands and responses: tools/alert/V2_SPEC.md section 7. It shares the
+ * port with the binary 0xABCD protocol (hotflash.py, serialtool) and must
+ * never consume a binary frame. Phase A is a stub that reads nothing.
+ */
+#ifndef APP_ALERT_CONSOLE_H
+#define APP_ALERT_CONSOLE_H
+
+#ifdef ENABLE_ALERT
+
+// Called every loop pass inside the ALERT app AND from app.c's 10 ms slice
+// outside it, so the console answers in normal radio operation too.
+void ALERTCON_Poll(void);
+
+#endif
+
+#endif

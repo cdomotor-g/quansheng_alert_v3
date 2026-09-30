@@ -218,8 +218,11 @@ enable_feature(ENABLE_FEAT_F4HWN_FOXHUNT
 # ALERT telemetry receiver (this fork)
 enable_feature(ENABLE_ALERT
     app/alert.c
+    app/alert_ui.c
+    app/alert_log.c
+    app/alert_stn.c
+    app/alert_console.c
     app/alert_decode.c
-    app/alert_stations.c
     app/alert_adc.c
 )
 

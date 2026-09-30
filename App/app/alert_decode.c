@@ -52,6 +52,8 @@ uint8_t ALERT_DecodePayload32(uint32_t payload, AlertReading_t *out)
 	const uint8_t k1 = (P(6) << 1) | P(7);      // word 1 check bits
 	const uint8_t k2 = (P(14) << 1) | P(15);    // word 2 check bits
 
+	out->payload = payload;                     // kept for the record, decoded or not
+
 	if (k1 == 2u && k2 == 2u) {
 		// ABF: words 3 and 4 carry check bits 11
 		if (P(22) && P(23) && P(30) && P(31)) {
@@ -97,6 +99,7 @@ bool ALERT_DecodeA2C(const uint8_t b[4], AlertReading_t *out)
 	out->format   = ALERT_FMT_A2C;
 	out->polarity = ALERT_POL_STANDARD;
 	out->bit_pos  = 0;
+	out->payload  = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
 	return true;
 }
 

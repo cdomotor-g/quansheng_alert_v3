@@ -15,6 +15,9 @@ Also exact, so also enforced: every settings name fits its nine-character
 field and there is one per SET_* row, and the three strings the CI binary check
 greps for ("ALERT SETTINGS", "SQ GATE", "MDM MODE") are still in the source.
 
+The screens are in alert_ui.c and the settings rows in alert.c: every file in
+SRCS is checked, and the settings and CI-string checks look across all of them.
+
 Only checks that are exact are enforced. Widths of formatted strings depend on
 the range of each argument, which is not visible here: guessing five digits for
 every %u flagged every line in the file and would have taught everyone to
@@ -28,7 +31,7 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SRC = os.path.join(ROOT, 'App', 'app', 'alert.c')
+SRCS = [os.path.join(ROOT, 'App', 'app', f) for f in ('alert.c', 'alert_ui.c')]
 
 CHAR_PX = 7                       # 6 px glyph + 1 px spacing
 LCD_PX = 128
@@ -38,10 +41,10 @@ BEZEL_ROW = 6                     # unreadable on this hardware
 STR = r'"((?:[^"\\]|\\.)*)"'
 
 
-def main():
-    text = open(SRC, 'r', encoding='utf-8', errors='replace').read()
-    name = os.path.basename(SRC)
-    problems = []
+def check_screen(path, problems):
+    """Checks 1-3 (rows, literal widths, status-line columns) on one file."""
+    text = open(path, 'r', encoding='utf-8', errors='replace').read()
+    name = os.path.basename(path)
 
     def lineno(pos):
         return text.count('\n', 0, pos) + 1
@@ -80,6 +83,20 @@ def main():
         if s2 < e1:
             problems.append('%s:%d  status "%s" ends at %d px but "%s" starts at %d'
                             % (name, l1, t1, e1, t2, s2))
+    return text
+
+
+def main():
+    problems = []
+    texts = {path: check_screen(path, problems) for path in SRCS}
+
+    # the settings table lives in whichever file defines setNames[]
+    path = next((p for p, t in texts.items() if 'setNames' in t), SRCS[0])
+    text = texts[path]
+    name = os.path.basename(path)
+
+    def lineno(pos):
+        return text.count('\n', 0, pos) + 1
 
     # 4. settings rows. Each is "%c%-9s%s": a name over nine characters pushes
     #    its value off the glass, and a name list that is longer or shorter than
@@ -105,9 +122,11 @@ def main():
     # 5. the strings CI looks for in the binary as proof the app was built in
     #    (.github/workflows/main.yml). Renaming one fails the build an hour later;
     #    this says so in a second.
+    everything = ''.join(texts.values())
     for s in ('ALERT SETTINGS', 'SQ GATE', 'MDM MODE'):
-        if '"%s"' % s not in text:
-            problems.append('%s  "%s" is gone, and the CI binary check greps for it' % (name, s))
+        if '"%s"' % s not in everything:
+            problems.append('%s  "%s" is gone, and the CI binary check greps for it'
+                            % ('/'.join(os.path.basename(p) for p in SRCS), s))
 
     for p in problems:
         print('FAIL  %s' % p)
