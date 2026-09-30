@@ -1,24 +1,111 @@
 name: Build Firmware
 
+# The ALERT build is the point of this fork, so CI builds it and publishes a
+# binary that can be flashed straight from UV Studio.
+#
+# History worth keeping, because each of these silently produced nothing:
+#   * the job ran only on pushes to main, while all development happened on a
+#     feature branch, so it never triggered;
+#   * it called compile-with-docker.sh with no arguments, which selects the
+#     Custom preset and leaves ENABLE_ALERT off - i.e. it would have built
+#     firmware with this fork's own app compiled out;
+#   * it uploaded compiled-firmware/f4hwn.packed.bin, a path nothing creates:
+#     the packing step is commented out upstream ("TODO: Incorparate venv?");
+#   * compile-with-docker.sh passed "docker run -it", which aborts without a
+#     TTY. Fixed in that script, so it now works headless as well.
+#
+# This builds with the ARM toolchain directly rather than through Docker. It is
+# the same compiler the image installs (arm-none-eabi-gcc 13.x) with far fewer
+# moving parts - no daemon, no image build, no toolchain tarball fetched from a
+# third-party host on every run. compile-with-docker.sh stays the documented
+# path for local builds.
+
 on:
   push:
     branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-
+  # The repo's own host-side checks. Seconds to run, and they catch the classes
+  # of fault that have actually cost this project time: a decoder regression, a
+  # status line too wide for the glass, a menu entry that is not wired up.
+  checks:
+    name: Host checks
+    runs-on: ubuntu-24.04
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-    - name: Compile firmware
-      run: |
-        chmod +x compile-with-docker.sh
-        ./compile-with-docker.sh
+      - name: Install pyserial
+        run: pip install --quiet pyserial
 
-    - name: Upload firmware artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: firmware-artifact
-        path: compiled-firmware/f4hwn.packed.bin
+      - name: Decoder host test (13 assertions)
+        run: |
+          gcc -std=c11 -Wall -Wextra -Werror -I App \
+              tools/alert/test_decode.c App/app/alert_decode.c -o test_decode
+          ./test_decode
+
+      - name: alertmon decoder round-trip
+        run: python3 tools/alert/test_alertmon.py
+
+      - name: Screen layout
+        run: python3 tools/alert/check_layout.py
+
+      - name: ALERT menu wiring
+        run: python3 tools/alert/check_menu_wiring.py
+
+  build:
+    name: Build ALERT firmware (RescueOps)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi ninja-build
+          arm-none-eabi-gcc --version
+
+      - name: Configure
+        run: cmake --preset RescueOps -DENABLE_ALERT=ON
+
+      - name: Build
+        run: cmake --build --preset RescueOps -j
+
+      # The binary is what gets flashed, so fail loudly rather than uploading an
+      # empty artifact, and confirm the app is actually in the image - a build
+      # with ENABLE_ALERT off would otherwise look like a perfectly good pass.
+      - name: Verify the ALERT app is present
+        run: |
+          BIN=build/RescueOps/f4hwn.rescueops.bin
+          test -s "$BIN" || { echo "::error::$BIN missing or empty"; exit 1; }
+          for s in "ALERT SETTINGS" "SQ GATE" "MDM MODE"; do
+            strings -n 4 "$BIN" | grep -qxF "$s" \
+              || { echo "::error::'$s' not found in $BIN - built with ENABLE_ALERT off?"; exit 1; }
+          done
+          echo "ALERT app present in $BIN"
+
+      - name: Report size
+        run: |
+          {
+            echo '### Flash and RAM'
+            echo
+            echo '```'
+            arm-none-eabi-size build/RescueOps/f4hwn.rescueops.elf
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: alert-v3-rescueops-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            build/RescueOps/f4hwn.rescueops.bin
+            build/RescueOps/f4hwn.rescueops.hex
+            build/RescueOps/f4hwn.rescueops.elf

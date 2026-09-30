@@ -50,9 +50,18 @@ build_preset() {
   echo ""
   echo "=== 🚀 Building preset: ${preset} ==="
   echo "---------------------------------------------"
+  # -it only when there is actually a terminal. Under CI stdin is not a TTY and
+  # "docker run -it" fails outright with "the input device is not a TTY", which
+  # is why the build workflow had never once produced a binary.
+  local tty_flags=()
+  if [[ -t 0 && -t 1 ]]; then
+    tty_flags=(-it)
+  fi
+
   docker run --rm \
     -u $(id -u):$(id -g) \
-    -it -v "$PWD":/src -w /src "$IMAGE" \
+    ${tty_flags[@]+"${tty_flags[@]}"} \
+    -v "$PWD":/src -w /src "$IMAGE" \
     bash -c 'which arm-none-eabi-gcc && arm-none-eabi-gcc --version &&
              cmake --preset "$1" "${@:2}" &&
              cmake --build --preset "$1" -j' \
