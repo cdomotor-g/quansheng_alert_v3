@@ -18,6 +18,7 @@ target_sources(App INTERFACE
     # Main
     app/action.c
     app/app.c
+    app/dfu.c
     app/chFrScanner.c
     app/common.c
     app/dtmf.c
@@ -219,6 +220,7 @@ enable_feature(ENABLE_ALERT
     app/alert.c
     app/alert_decode.c
     app/alert_stations.c
+    app/alert_adc.c
 )
 
 enable_feature(ENABLE_FEAT_F4HWN_ACTION_PICKER)
