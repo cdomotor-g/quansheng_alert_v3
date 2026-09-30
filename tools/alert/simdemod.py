@@ -151,6 +151,9 @@ def demod(samples, inc1, inc2, corr_w, spb):
         phase += 1
         if phase >= spb:
             phase = 0
+        # alert_adc.c: the bit is taken half a bit after the locked transitions,
+        # not at phase 0 (which is the bit boundary)
+        if phase == spb // 2:
             bits.append(bit)
     return bits
 

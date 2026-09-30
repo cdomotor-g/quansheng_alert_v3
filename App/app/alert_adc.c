@@ -165,10 +165,18 @@ static inline void DemodSample(int32_t raw)
 		dm.lastBit = bit;
 	}
 
-	if (++dm.phase >= DEMOD_SPB) {
+	if (++dm.phase >= DEMOD_SPB)
 		dm.phase = 0;
-		// sample point: the correlator window (~half a bit) already delays the
-		// decision, so the current one is the middle of the bit
+	// Sample point: half a bit after the transitions the loop above locks to.
+	// This used to be phase 0, on the reasoning that the correlator's delay
+	// already put that mid-bit - but the transitions the loop steers by come
+	// through the very same correlator, so the delay cancels and phase 0 is the
+	// bit boundary. On air that decoded 6 bursts of 12; through simdemod.py,
+	// with a 1.5% rate error or the 4 dB the de-emphasis takes off 2100 Hz, it
+	// goes from 37-72% of frames to 100%, and with noise from ~5% to 65-85%.
+	// The adjustments above only ever move the phase away from 16 in the
+	// direction it is already going, so each bit is still taken exactly once.
+	if (dm.phase == DEMOD_SPB / 2u) {
 		if (dm.nbits < DEMOD_BITS) {
 			const uint8_t m = (uint8_t)(0x80u >> (dm.nbits & 7u));
 			if (bit) dm.buf[dm.nbits >> 3] |= m;
