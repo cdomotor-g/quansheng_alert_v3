@@ -56,11 +56,16 @@
 //   b[3]  free
 //   b[4]  <7:4> CFG_MAGIC, <3:1> layout version, <0> confirm
 //
+// Only a decode sets b[2]<1:0> (BurstFinish), and a census that picks a
+// different pin leaves it and the pin alone until that pin decodes, so what
+// is in flash is always a pin that has decoded on this radio.
+//
 // Layout 0 is the X1 sweep build's: b[0]<6> bit reverse, <7> monitor, b[1]
 // and b[3] the adopted arrangement and variant, and b[2]<1:0> the adopted
-// route, where 2 was the ADC. b[2] was kept bit for bit, so an ADC adoption
-// made by the sweep reads as a confirmed census choice and this radio skips
-// the census on its first entry after the update.
+// route, where 2 was the ADC. That route was earned by decodes, but not the
+// pin bits beside it: X1 re-ran the census on every entry and saved whatever
+// it picked last. So an X1 radio's pin is not taken as confirmed, and its
+// first entry after the update runs the census, as every X1 entry did.
 
 #define CFG_MAGIC   0xC0u
 #define CFG_VERSION 1u
@@ -107,9 +112,11 @@ static void LoadConfig(void)
 	gAlertCfg.adc_pa8      = b[2] & (1u << 4);
 	if (ver == 0) {
 		// X1 layout: the new settings take their defaults, and MONITOR ON
-		// carries over as SPEAKER ON
+		// carries over as SPEAKER ON. The pin was not necessarily the one
+		// that decoded (see the layout notes above).
 		if (b[0] & (1u << 7))
 			gAlertCfg.speaker = ALERT_SPK_ON;
+		gAlertCfg.adc_ok = false;
 	} else {
 		gAlertCfg.csv     = b[0] & 1u;
 		gAlertCfg.log     = b[0] & (1u << 6);
@@ -270,6 +277,17 @@ static uint16_t lastBits;        // bits the demodulator gave for the last burst
 static void AudioPath(void)
 {
 	if (gAlertCfg.speaker == ALERT_SPK_ON) AUDIO_AudioPathOn(); else AUDIO_AudioPathOff();
+}
+
+// Apply a census choice with the amplifier off. The PA4B bias steps PA4 from
+// wherever it floats to mid-rail, and PA4 is in the speaker path: switched
+// with PA8 on, the step clicks the speaker. The census applies its own choice
+// with PA8 off for the same reason (alert_adc.c).
+static void SetChoiceQuiet(uint8_t pin, bool pa8)
+{
+	AUDIO_AudioPathOff();
+	ALERTADC_SetChoice(pin, pa8);
+	AudioPath();
 }
 
 // burst state
@@ -525,16 +543,29 @@ static void BurstFinish(void)
 		// air after it had decoded three bursts out of three: the FM
 		// discriminator's idle hiss fills the same band, so the tones sat only
 		// ~6 dB over it. Check bits passing is far stronger evidence than that.
-		if (na)
+		if (na) {
+			// Remembered, so the next entry goes straight to receiving. Only a
+			// decode is: the energy test has been wrong on air (above), and a
+			// pin saved on its word alone would be sampled on every power-up
+			// from then on without ever decoding. (CONFIRM means this choice
+			// is not the saved one: RunCensus goes straight to ON when it is.)
 			adcState = ADCST_ON;
-		else if (++confN >= 3u)
-			adcState = (confOk >= 2u) ? ADCST_ON : ADCST_REJECT;
-		if (adcState == ADCST_ON) {
-			// remembered, so the next entry goes straight to receiving
 			gAlertCfg.adc_pin = ALERTADC_ChoicePin();
 			gAlertCfg.adc_pa8 = ALERTADC_ChoicePa8();
 			gAlertCfg.adc_ok  = true;
 			ALERT_SettingsChanged();
+		} else if (++confN >= 3u) {
+			if (gAlertCfg.adc_ok && gAlertCfg.adc_pin) {
+				// A re-run census picked a pin that has not decoded in three
+				// bursts. The saved one has decoded on this radio, so it
+				// comes back, as it does when the census finds nothing.
+				SetChoiceQuiet(gAlertCfg.adc_pin, gAlertCfg.adc_pa8);
+				adcState = ADCST_ON;
+			} else {
+				// Nothing proven to fall back to: the energy test decides,
+				// for this session only.
+				adcState = (confOk >= 2u) ? ADCST_ON : ADCST_REJECT;
+			}
 		}
 	}
 
@@ -612,24 +643,26 @@ static void RunCensus(void)
 	bool ok;
 	censusBusy = true;
 	ALERTUI_Draw();                  // it blocks for seconds; say why the screen froze
+	// The census drops any bias first and applies its choice's last, and puts
+	// PA8 back as it found it: with the amplifier off here, neither step
+	// reaches the speaker (see SetChoiceQuiet). RxArm below restores SPEAKER.
+	AUDIO_AudioPathOff();
 	DFU_WatchdogKick();
 	ok = ALERTADC_Census(DbgSend);
 	DFU_WatchdogKick();
 	censusBusy = false;
 	censusReq  = false;              // after, so the menu row reads PENDING throughout
 	if (ok) {
-		// The same pin again keeps its confirmation; a different one earns its own.
+		// The same pin again keeps its confirmation. A different one has to
+		// decode before it replaces the saved choice (BurstFinish); until then
+		// gAlertCfg, and flash, keep the old one to fall back to.
 		const bool same = gAlertCfg.adc_ok && gAlertCfg.adc_pin == ALERTADC_ChoicePin() &&
 		                  gAlertCfg.adc_pa8 == ALERTADC_ChoicePa8();
-		gAlertCfg.adc_pin = ALERTADC_ChoicePin();
-		gAlertCfg.adc_pa8 = ALERTADC_ChoicePa8();
-		gAlertCfg.adc_ok  = same;
 		adcState = same ? ADCST_ON : ADCST_CONFIRM;
-		if (!same)
-			ALERT_SettingsChanged();
 	} else if (gAlertCfg.adc_ok && gAlertCfg.adc_pin) {
 		// Confirmed before, missed now - the census depends on the volume knob
-		// among other things. Trust the bursts that confirmed it.
+		// among other things. Trust the bursts that confirmed it. The
+		// amplifier is still off.
 		ALERTADC_SetChoice(gAlertCfg.adc_pin, gAlertCfg.adc_pa8);
 		adcState = ADCST_ON;
 	} else {
@@ -777,7 +810,13 @@ static void StepSquelch(int dir)
 	ApplySquelch();
 }
 
-void ALERT_SetStep(uint8_t row, int dir)
+// Outside the app - the console also runs from app.c's slice, in normal radio
+// operation - the BK4819 and the speaker belong to the rest of the firmware:
+// RxArm there would drop the CTCSS/DCS/DTMF interrupts RADIO_SetupRegisters
+// enabled and force the AF to FM, possibly in the middle of a transmission.
+// So without `running` only the app's own settings change, and the rows that
+// act on the receiver refuse.
+bool ALERT_SetStep(uint8_t row, int dir)
 {
 	switch (row) {
 		case SET_POLARITY: gAlertCfg.polarity = (uint8_t)((gAlertCfg.polarity + 3 + dir) % 3); break;
@@ -790,10 +829,17 @@ void ALERT_SetStep(uint8_t row, int dir)
 			// it) are the two states this row has always had. Only the audio
 			// path moves: the AF stays at FM for the ADC.
 			gAlertCfg.speaker = (gAlertCfg.speaker == ALERT_SPK_ON) ? ALERT_SPK_SQL : ALERT_SPK_ON;
-			AudioPath();
+			if (running)
+				AudioPath();
 			break;
-		case SET_CENSUS:   censusReq = true; break;
+		case SET_CENSUS:
+			if (!running)
+				return false;
+			censusReq = true;
+			break;
 		case SET_FREQ: {
+			if (!running)
+				return false;
 			// Frequency is in units of 10 Hz. Step 12.5 kHz, the ALERT channel
 			// spacing, and keep it inside the 2 m / VHF range the receiver can
 			// actually tune.
@@ -806,10 +852,15 @@ void ALERT_SetStep(uint8_t row, int dir)
 			RxArm();
 			break;
 		}
-		case SET_SQL:      StepSquelch(dir); break;
-		default: break;                          // SET_MODE is read-only
+		case SET_SQL:
+			if (!running)
+				return false;
+			StepSquelch(dir);
+			break;
+		default: return false;                   // SET_MODE is read-only
 	}
 	redraw = true;
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -887,19 +938,23 @@ void APP_RunAlert(void)
 	AUDIO_AudioPathOff();
 	rssiDbm = BK4819_GetRSSI_dBm();
 
-	// Receiving from the start so the floor settles; bursts during the settle
-	// are seen but not decoded.
-	RxArm();
-
 	// A census choice that has decoded before is used as it stands: the census
 	// takes seconds, and its verdict depends on the volume knob among other
-	// things. Setting CENSUS runs it again.
+	// things. Setting CENSUS runs it again. Applied here, before RxArm opens
+	// the speaker path, so the bias goes on with the amplifier off (see
+	// SetChoiceQuiet), and after a Shutdown, so the ADC starts from
+	// BOARD_ADC_Init's state exactly as it does after a census.
 	settleMs = SETTLE_MS;
 	if (gAlertCfg.adc_ok && gAlertCfg.adc_pin) {
+		ALERTADC_Shutdown();
 		ALERTADC_SetChoice(gAlertCfg.adc_pin, gAlertCfg.adc_pa8);
 		adcState = ADCST_ON;
 		settleMs = SETTLE_KNOWN_MS;
 	}
+
+	// Receiving from the start so the floor settles; bursts during the settle
+	// are seen but not decoded.
+	RxArm();
 
 	while (running) {
 		DFU_WatchdogKick();
@@ -1012,7 +1067,10 @@ void APP_RunAlert(void)
 		}
 	}
 
-	// leave: ADC off, radio back to normal
+	// leave: ADC off, radio back to normal. The amplifier goes off first:
+	// Shutdown drops the PA4B bias, and RADIO_SetupRegisters would only switch
+	// PA8 off after that step had reached the speaker.
+	AUDIO_AudioPathOff();
 	if (adcRunning) {
 		(void)ALERTADC_BurstStop(adcBits, 0);
 		adcRunning = false;

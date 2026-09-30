@@ -113,10 +113,18 @@ const char *ALERT_AudName(void);         // census pin: "NONE", "PA4", "PA4B", "
 
 // Settings rows, shared by the settings view and the console. Names are at
 // most 9 characters, values at most 8 (the settings row is 1 + 9 + 8 = 18).
+//
+// ALERT_SetStep: +1 UP, -1 DOWN. While APP_RunAlert runs it takes effect at
+// once, receiver included. Outside the app (the console from app.c's slice)
+// it never touches the BK4819 or the speaker: the rows that would - FREQ,
+// SQL LEVEL, CENSUS - return false and change nothing, as does a read-only
+// row, and SPEAKER changes the setting only. It saves nothing: follow it with
+// ALERT_SettingsChanged, which outside the app updates gEeprom but leaves the
+// flash write to the next settings save (the persist request is the loop's).
 uint8_t     ALERT_SetCount(void);
 const char *ALERT_SetName(uint8_t row);
 void        ALERT_SetValue(uint8_t row, char *out);   // out: >= 9 bytes
-void        ALERT_SetStep(uint8_t row, int dir);      // +1 UP, -1 DOWN; takes effect at once
+bool        ALERT_SetStep(uint8_t row, int dir);      // false: not changed (see above)
 
 // ---------------------------------------------------------------------------
 // alert_ui.c
