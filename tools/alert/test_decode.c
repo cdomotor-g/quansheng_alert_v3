@@ -448,6 +448,19 @@ int main(void)
 		      n == 1 && r[0].id == 6129);
 	}
 
+	/* 11b. off air, 2026-09-30, through the PA4 audio route: Bundamba 2044 sent
+	 *      40 bits that do not frame between its preamble and the real frame.
+	 *      The strictly back-to-back look-back has to let it through the gate. */
+	{
+		static const uint8_t BUNDAMBA[] = {
+			0x00, 0x00, 0x00, 0xFD, 0x3E, 0x5A, 0xC7, 0xF1, 0xC1,
+			0x41, 0x5F, 0x47, 0x70, 0x3A, 0xD4, 0xAD, 0x3D,
+		};
+		n = ALERT_ScanBitsGated(BUNDAMBA, 136, ALERT_POL_STANDARD, 20, true, 12, r, 8);
+		check("ScanBitsGated, off-air Bundamba, gate 12 -> ABF 2044 = 136 at bit 63",
+		      n == 1 && r[0].id == 2044 && r[0].value == 136 && r[0].bit_pos == 63);
+	}
+
 	/* 12. lockstep with tools/alert/scan_samples.py */
 	make_noise(0x1234ABCDu);
 	for (int t = 0; t < 6; t++) {

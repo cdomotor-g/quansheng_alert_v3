@@ -694,7 +694,7 @@ def main(argv=None):
     ap.add_argument("--meganet-ref", default="main", help="git ref to fetch (default main)")
     ap.add_argument("--filter", default=os.path.join(here, "stations.filter"))
     ap.add_argument("--out", default=os.path.join(here, "app", "alert_stations_gen.h"))
-    ap.add_argument("--max-bytes", type=int, default=6400)
+    ap.add_argument("--max-bytes", type=int, default=8000)
     ap.add_argument("--list-networks", action="store_true",
                     help="print per-network / per-catchment costs and exit")
     ap.add_argument("--check", action="store_true",

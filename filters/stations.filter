@@ -96,8 +96,11 @@
 #     Mt Kanigan + Mt Glorious (SEQWater)        369 sites, 824 addrs, 6,222 bytes
 # Constitution Hill only fits if --max-bytes is raised back to 6,800 or more.
 
-network Mt Kanigan
+# 2026-09-30: retargeted at South East Queensland. The radio on 151.500 MHz decodes
+# Beachmere 4133 and Bundamba 2044 off air - both Constitution Hill network - and not
+# one station from the old Mt Kanigan set. Needs --max-bytes 8000 (flash has room since
+# the X1 build: ~13 KB free before this change).
+network Constitution Hill
 network Mt Glorious
-network Barcaldine
 network Marburg
 network Mt Stapylton

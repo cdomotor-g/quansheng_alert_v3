@@ -115,6 +115,9 @@ static uint32_t assemble(const uint8_t words[4])
 // has no preamble of its own.
 #define SCAN_EXEMPT_BITS 20u
 
+// How far behind the end of an idle run a strictly back-to-back frame may start.
+#define SCAN_LOOKBACK_BITS 48u
+
 static int scan_polarity(const uint8_t *buf, uint32_t nbits, uint8_t polarity,
                          uint8_t max_gap, uint8_t inv, uint8_t min_idle_bits,
                          AlertReading_t *out, int max_out)
@@ -177,6 +180,23 @@ static int scan_polarity(const uint8_t *buf, uint32_t nbits, uint8_t polarity,
 				while (j < p0 && GB(j) == idle)
 					j++;
 				gate = (j == p0);
+			}
+			// A strictly back-to-back frame may also sit a little way behind the
+			// preamble. Seen on air from Bundamba 2044: 40 bits of something that
+			// does not frame, then the real frame, no idle between. Real ALERT
+			// words go out back to back, and demanding that here keeps the chance
+			// rate on noise where the plain gate has it (0.04% of 136-bit
+			// captures, measured through the Python port, against 0.29% for the
+			// same look-back with the usual 20-bit word gap).
+			if (!gate && min_idle_bits &&
+			    word_pos[1] == p0 + 10u && word_pos[2] == p0 + 20u && word_pos[3] == p0 + 30u) {
+				const uint32_t lo = (p0 > SCAN_LOOKBACK_BITS + min_idle_bits)
+				                  ? p0 - SCAN_LOOKBACK_BITS - min_idle_bits : 0u;
+				uint32_t run = 0;
+				for (uint32_t k = lo; k < p0 && !gate; k++) {
+					run = (GB(k) == idle) ? run + 1u : 0u;
+					gate = run >= min_idle_bits && k + 1u + SCAN_LOOKBACK_BITS >= p0;
+				}
 			}
 
 			AlertReading_t r;

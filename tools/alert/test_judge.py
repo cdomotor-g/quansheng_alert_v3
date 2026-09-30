@@ -43,7 +43,7 @@ import sweep_judge as sj  # noqa: E402
 import radio  # noqa: E402
 
 TABLE = sj.load_table()
-STATION = 702               # MURTS HILL MO rain gauge
+STATION = 4132              # BEACHMERE ST rain gauge (heard off air, 2026-09-30)
 assert STATION in TABLE
 
 L_ROWS = {  # tag: (idx, r58, t2, r70, t1, sync, 5c, policy)
@@ -207,7 +207,7 @@ def scenario_works(td, rnd):
         w.heartbeats(12)
         w.burst_lines(idx, 300, [], b'', src='none', dt='NA', pn='-')
     w.put('Z 0 bq=4 bb=4 bs=4 bt=4 dx=4 dt=4 rep=4 ns=0')
-    w.put('ALERT,702,103,MURTS HILL MO,-18,RAIN')
+    w.put('ALERT,%d,103,BEACHMERE ST,-18,RAIN' % STATION)
     w.put('K ok')
     p = os.path.join(td, 'works.log')
     w.write(p)
@@ -318,7 +318,7 @@ def scenario_adc(td, rnd):
         s = [1] * 16 + [rnd.randint(0, 1) for _ in range(560)]
         b = w.burst_lines(idx, 1200, s, store(s), dt=40, pn='P')
         w.put('X ADC %d id=%d v=%d fmt=EIF pol=N inv=0 pos=40 known=1' % (b, STATION, i))
-    w.put('G ADOPT ADC v=0 id=702 rep=3')
+    w.put('G ADOPT ADC v=0 id=%d rep=3' % STATION)
     p = os.path.join(td, 'adc.log')
     w.write(p)
     return p
@@ -541,8 +541,8 @@ def main():
         print(text)
         check('works: exit 0', code == 0, code)
         check('works: A1 WORKS', a['A1']['verdict'] == 'WORKS', a['A1'])
-        check('works: A1 REPEAT 4 on 702, NEG framing, inverted sense',
-              a['A1']['repeat'] == 4 and a['A1']['repeat_path'] == '702 N inv1',
+        check('works: A1 REPEAT 4 on the station, NEG framing, inverted sense',
+              a['A1']['repeat'] == 4 and a['A1']['repeat_path'] == '%d N inv1' % STATION,
               (a['A1']['repeat'], a['A1']['repeat_path']))
         # at integer k a byte holds whole bits, so STRUCT alone may not tell the
         # orders apart; the decode does

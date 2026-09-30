@@ -477,9 +477,11 @@ static uint8_t ScoreRep(uint8_t slot, const AlertReading_t *r, int n, uint16_t *
 {
 	uint8_t best = 0;
 	for (int i = 0; i < n; i++) {
+		// Every id counts, table or not. The first stations heard on air
+		// (Beachmere 4133, Bundamba 2044) are outside the station table, and a
+		// chance decode lands on a random 13-bit id, so the same one coming
+		// back in a separate burst is the evidence either way.
 		bool dup = false;
-		if (!Known(r[i].id))
-			continue;
 		for (int j = 0; j < i; j++)
 			if (r[j].id == r[i].id) { dup = true; break; }
 		if (dup)
@@ -1249,7 +1251,13 @@ static void BurstFinish(void)
 		const bool ok = g13 != ALERTADC_LEVEL_NONE && g21 != ALERTADC_LEVEL_NONE &&
 		                idle != ALERTADC_LEVEL_NONE && (g13 - idle) >= 100 && (g21 - idle) >= 100;
 		if (ok) confOk++;
-		if (++confN >= 3u)
+		// A decode settles it outright. The energy test alone rejected PA4 on
+		// air after it had decoded three bursts out of three: the FM
+		// discriminator's idle hiss fills the same band, so the tones sat only
+		// ~6 dB over it. Check bits passing is far stronger evidence than that.
+		if (na)
+			adcState = ADCST_ON;
+		else if (++confN >= 3u)
 			adcState = (confOk >= 2u) ? ADCST_ON : ADCST_REJECT;
 	}
 

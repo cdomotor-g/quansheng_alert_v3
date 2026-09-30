@@ -36,6 +36,7 @@ FMT_NONE, FMT_ABF, FMT_EIF = 0, 1, 2
 
 SCAN_MAX_GAP = 20      # idle bits allowed between the words of one frame
 SCAN_EXEMPT_BITS = 20  # a frame this close after an accepted one skips the idle gate
+SCAN_LOOKBACK_BITS = 48
 SCAN_MAX_TRANS = 20    # more transitions than this inside one word span is noise
 SCAN_MED_MIN_Q8 = 512  # median-of-3 only when every bit spans at least 2 samples
 SCAN_SPB_MIN_Q8 = 256
@@ -319,6 +320,17 @@ def _scan_bits_pol(buf, nbits, pol, max_gap, inv, min_idle_bits, out, max_out):
                 while j < p0 and GB(j) == idle:
                     j += 1
                 gate = j == p0
+            # strictly back-to-back frame a little way behind the preamble
+            # (alert_decode.c, SCAN_LOOKBACK_BITS)
+            if (not gate and min_idle_bits and word_pos[1] == p0 + 10
+                    and word_pos[2] == p0 + 20 and word_pos[3] == p0 + 30):
+                lo = p0 - SCAN_LOOKBACK_BITS - min_idle_bits
+                run = 0
+                for k in range(max(0, lo), p0):
+                    run = run + 1 if GB(k) == idle else 0
+                    if run >= min_idle_bits and k + 1 + SCAN_LOOKBACK_BITS >= p0:
+                        gate = True
+                        break
             if gate:
                 d = decode_payload32(assemble(words))
                 if d is not None:
@@ -638,9 +650,16 @@ def selftest(robust_n):
             g12 = scan_bits_gated(buf, n, pol, 20, inv, 12)
             check('gated 1x, gate 0 finds both', [x.id for x in g0] == [a, a ^ 1])
             check('gated 1x, gate 12, lead %d' % lead, [x.id for x in g12] == want)
+            # a failed frame then a real one, the Bundamba 2044 shape seen on
+            # air: inside SCAN_LOOKBACK_BITS of the preamble it is let through,
+            # two failed frames back (88 bits) it is not
             s = symbols([busy, eif_words(a ^ 1, d)], logic, 20, gap_bits=4)
             buf, n = pack([x ^ lvl for x in s])
-            check('gated 1x, no exemption after a failed frame',
+            check('gated 1x, frame behind a failed one, inside the look-back',
+                  [x.id for x in scan_bits_gated(buf, n, pol, 20, inv, 12)] == [a ^ 1])
+            s = symbols([busy, busy, eif_words(a ^ 1, d)], logic, 20, gap_bits=4)
+            buf, n = pack([x ^ lvl for x in s])
+            check('gated 1x, frame behind two failed ones, past the look-back',
                   scan_bits_gated(buf, n, pol, 20, inv, 12) == [])
     ref = [(r.id, r.value, r.format, r.polarity, r.bit_pos)
            for r in scan_bits_gated(bytes([0, 0, 0, 0xC7, 0xBF, 0x6F, 0xC3, 0xC0, 0, 0]), 75,
