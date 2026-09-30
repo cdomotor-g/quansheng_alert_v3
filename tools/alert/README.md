@@ -357,6 +357,33 @@ decodes correctly end to end:
 python tools/alert/wavdecode.py burst.wav
 ```
 
+## V2: the serial interface and alertterm.py
+
+V2 replaces the `ALERT,` line with CSV records (`HDR` `DEC` `BST` `STA`
+`EVT`) and adds a text console on the same USB port. `docs/ALERT_SERIAL.md`
+is the full reference, and it is the page to hand to a person or an agent.
+It covers the port (VID 36B7, DTR required), every field, the console
+commands with example sessions, the station upload, the screen dump and the
+binary 0xABCD commands that remain.
+
+`alertterm.py` is the reference client. It finds the radio by VID and sets
+its clock on connect:
+
+```bash
+python tools/alert/alertterm.py live                       # decode table; raw lines to logs/live-*.log
+python tools/alert/alertterm.py info
+python tools/alert/alertterm.py set CSV_OUT ON
+python tools/alert/alertterm.py log-download --csv decodes.csv
+python tools/alert/alertterm.py stations-upload --all      # whole of MegaNet, via gen_stations.py --blob
+python tools/alert/alertterm.py screenshot screen.png --scale 4
+python tools/alert/alertterm.py console                    # type HELP
+python tools/alert/test_console.py                         # its tests, against the doc's examples
+```
+
+`alertmon.py` shows `DEC` lines and re-decodes the bits of each `BST` line.
+`radio.py log` records everything, now to `logs/alert-*.log`. Only one of
+these tools can hold the port at a time.
+
 ## The tools
 
 | | |

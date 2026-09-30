@@ -2,8 +2,9 @@
  * for how the modules divide the work.
  *
  * This file owns the radio: entry and the main loop, the keys that act on the
- * receiver, squelch edges -> ADC burst -> decode -> record, the configuration
- * and the lines that go out over USB.
+ * receiver, squelch edges -> ADC burst -> decode -> record, the noise floor,
+ * the speaker, the configuration and the CSV lines that go out over USB and
+ * the UART (tools/alert/V2_SPEC.md sections 4, 5 and 6).
  *
  * Copyright 2026 cdomotor-g. Apache-2.0, like the egzumer base it lives in.
  */
@@ -32,6 +33,7 @@
 #include "board.h"
 #include "external/printf/printf.h"
 #include "functions.h"
+#include "helper/battery.h"
 #include "misc.h"
 #include "py32f0xx.h"
 #include "radio.h"
@@ -39,22 +41,31 @@
 #include "settings.h"
 #include "ui/ui.h"
 #ifdef ENABLE_UART
-	#include "driver/uart.h"
+	#include "py32f071_ll_usart.h"
 #endif
 #ifdef ENABLE_USB
 	#include "driver/vcp.h"
 #endif
 
+// App/CMakeLists.txt defines it for every App source; dfu.c falls back the same way
+#ifndef BUILD_COMMIT
+	#define BUILD_COMMIT "unknown"
+#endif
+
 // ---------------------------------------------------------------------------
 // configuration (persisted in gEeprom.ALERT_CFG[5], see settings.c)
 //
-//   b[0]  <0> CSV OUT, <2:1> polarity, <3> voice, <4> SQ GATE,
+//   b[0]  <0> CSV OUT, <2:1> polarity (always ANY now), <3> voice, <4> SQ GATE,
 //         <5> show unknown, <6> LOG, <7> DEBUG
 //   b[1]  <1:0> SPEAKER (ALERT_SPK_*), <7:3> SNR REQ in dB
 //   b[2]  <1:0> 2 = the census choice below has decoded, <3:2> ADC pin
 //         (ALERTADC_SetChoice numbering), <4> PA8 needed by that pin
 //   b[3]  free
 //   b[4]  <7:4> CFG_MAGIC, <3:1> layout version, <0> confirm
+//
+// POLARITY is no longer a setting (V2_SPEC 5 does not list it): the decoder
+// always tries both framings. A NEG or STD saved by an earlier build is not
+// read back, since with the row gone nothing could ever put it right.
 //
 // Only a decode sets b[2]<1:0> (BurstFinish), and a census that picks a
 // different pin leaves it and the pin alone until that pin decodes, so what
@@ -72,12 +83,15 @@
 #define CFG_ADC_OK  2u     // b[2]<1:0>
 
 AlertCfg_t gAlertCfg;
+// The console reads and changes settings from app.c's slice too, possibly
+// before the app has ever been entered: until then gAlertCfg is all zeros.
+static bool cfgLoaded;
 
 static void DefaultConfig(void)
 {
-	// ANY, not NEGATIVE: nothing has established the sense on this radio, and
-	// it is the table-station and repeat rules that keep chance hits out, not
-	// a guess at the polarity. The rest are V2_SPEC section 5's defaults.
+	// ANY: nothing has established the sense on this radio, and it is the
+	// table-station and repeat rules that keep chance hits out, not a guess at
+	// the polarity. The rest are V2_SPEC section 5's defaults.
 	gAlertCfg.polarity     = ALERT_POL_ANY;
 	gAlertCfg.voice        = false;
 	gAlertCfg.speaker      = ALERT_SPK_SQL;
@@ -98,11 +112,11 @@ static void LoadConfig(void)
 	const uint8_t *b = gEeprom.ALERT_CFG;
 
 	DefaultConfig();
+	cfgLoaded = true;
 	if ((b[4] & 0xF0u) != CFG_MAGIC)
 		return;
 
 	const uint8_t ver = (b[4] >> 1) & 7u;
-	gAlertCfg.polarity     = (b[0] >> 1) & 3u;
 	gAlertCfg.voice        = b[0] & (1u << 3);
 	gAlertCfg.gate         = b[0] & (1u << 4);
 	gAlertCfg.show_unknown = b[0] & (1u << 5);
@@ -124,12 +138,17 @@ static void LoadConfig(void)
 		gAlertCfg.speaker = b[1] & 3u;
 		gAlertCfg.snr_req = b[1] >> 3;
 	}
-	if (gAlertCfg.polarity > ALERT_POL_ANY)  gAlertCfg.polarity = ALERT_POL_ANY;
 	if (gAlertCfg.speaker > ALERT_SPK_ON)    gAlertCfg.speaker  = ALERT_SPK_SQL;
 	if (gAlertCfg.snr_req < ALERT_SNR_MIN || gAlertCfg.snr_req > ALERT_SNR_MAX)
 		gAlertCfg.snr_req = ALERT_SNR_DEFAULT;
 	if (!gAlertCfg.adc_pin)
 		gAlertCfg.adc_ok = false;   // nothing to skip the census for
+}
+
+static void CfgReady(void)
+{
+	if (!cfgLoaded)
+		LoadConfig();
 }
 
 static void StoreConfig(void)
@@ -175,8 +194,9 @@ static uint16_t burstCount;     // qualifying bursts since boot
 static uint32_t decodesTotal;   // frames delivered since boot
 // A squelch opening is not the same thing as a transmission. At SQL 1.0 the
 // squelch flickers on noise; a burst only counts if it rose well clear of the
-// noise, and the floor is measured rather than assumed so it works wherever
-// the radio happens to be.
+// noise. This floor - a slow minimum - is the one SQ GATE has been tuned and
+// proven on air against, so it stays the gate's; the averaged noise floor
+// below is the reported one (V2_SPEC 4).
 #define BURST_MARGIN_DB 15
 static int16_t  rssiFloor;      // slow minimum: the noise floor, in dBm
 static int16_t  burstPeak;      // strongest RSSI during the burst in progress
@@ -213,14 +233,46 @@ static uint32_t settleMs;
 static bool     censusReq;       // run the census again at the next quiet moment
 static bool     censusBusy;      // for the screen: the census blocks for seconds
 
+// Noise floor (V2_SPEC 4): an exponential average of the RSSI taken every
+// 10 ms while the squelch is shut, alpha 1/3000 - a ~30 s time constant -
+// seeded with the mean of the first second. Q16 rather than the spec's
+// suggested Q8: at alpha 1/3000 a Q8 step is (diff * 256) / 3000, zero for
+// any difference under 12 dB, so a Q8 average would never move at all for
+// the few-dB changes it is there to follow. Q16 leaves a 0.05 dB dead band.
+#define NF_ALPHA_DIV 3000
+#define NF_SEED_N    100         // signed: it divides a negative sum
+#define NF_HOLD_MS   500u        // after each squelch close: the tail is not noise
+static int32_t  nfQ16;           // dBm * 65536, valid once seeded
+static int32_t  nfSeedSum;
+static uint8_t  nfSeedN;
+
+// The weakest peak RSSI that has decoded a table station this boot (V2_SPEC
+// 4). Table stations only: an unknown address may be a chance hit on noise,
+// and one of those would set a sensitivity nothing can actually reach.
+#define MINOK_NONE 127
+static int16_t  minOk = MINOK_NONE;
+
+// SPEAKER=SQL: the squelch has opened for a transmission not yet finished
+// (BurstOpen -> BurstFinish), so the speaker path is wanted on.
+static bool     txOpen;
+
+// Records and lines
+static uint32_t bootSeq;         // DEC seq when not logging: records since boot
+static uint8_t  csvLines;        // CSV lines since the last HDR block
+static uint32_t staMs;           // nowMs of the last STA line
+static uint16_t setDirty;        // settings rows changed, EVT SET owed (1 << row)
+static bool     logErr;          // an append failed this entry: said once
+static bool     bootSaid;        // EVT BOOT: once per power-up
+
 // ---------------------------------------------------------------------------
-// USB lines
+// USB and UART lines
 
 // Debug telemetry over USB. UART_ServiceCommands() runs on every pass of the
 // main loop below, and cdc_acm_data_send_with_dtr() is a no-op unless a host
 // has the port open with DTR asserted, so this costs nothing when nobody is
-// listening. When someone is, it blocks until the bytes are gone, which is why
-// no line is ever sent while the squelch is open.
+// listening. When someone is, it blocks until the bytes are gone (~1 ms a
+// line), which is why nothing but a key press ever sends while a burst is
+// being sampled.
 static void DbgSend(const char *s)
 {
 #ifdef ENABLE_USB
@@ -230,11 +282,77 @@ static void DbgSend(const char *s)
 #endif
 }
 
-// USB only, like every line before it: the UART at 38400 would hold the loop
-// for ~25 ms a line, and only the ALERT, line has ever gone out there.
+// The DEBUG lines: D heartbeat, A bits, X frames, and the census's P/PT/AUD.
+static void DbgLine(const char *s)
+{
+	if (gAlertCfg.debug)
+		DbgSend(s);
+}
+
+// USB only. The console answers through this, and an answer belongs on the
+// port the question came in on; the CSV lines use Out2 below.
 void ALERT_Emit(const char *line)
 {
 	DbgSend(line);
+}
+
+#ifdef ENABLE_UART
+// The UART copy of the CSV lines, queued and drained a byte or two per loop
+// pass. At 38400 a 190-character DEC line holds the wire for 50 ms, and a
+// blocking send after a burst would still be going when a repeater's copy of
+// it starts. A line is queued whole or not at all, so the UART never carries
+// half a line; USB has every line regardless.
+static uint8_t uq[256];
+static uint8_t uqHead, uqTail;   // uint8_t: the ring wraps by itself
+
+static void UartDrain(void)
+{
+	while (uqTail != uqHead && LL_USART_IsActiveFlag_TXE(USART1))
+		LL_USART_TransmitData8(USART1, uq[uqTail++]);
+}
+
+// Wait for room for n more bytes - but never while the squelch is open (the
+// burst matters more than the UART's copy of a line) and never for more than
+// ~100 ms (a UART that has stopped).
+static bool UartRoom(uint16_t n)
+{
+	const uint32_t t0 = SCHEDULER_Ticks10ms();
+	while ((uint16_t)(uint8_t)(uqHead - uqTail) + n > 255u) {
+		if ((BK4819_ReadRegister(BK4819_REG_0C) & 2u) || SCHEDULER_Ticks10ms() - t0 > 10u)
+			return false;
+		UartDrain();
+	}
+	return true;
+}
+
+static void UartLine(const char *s)
+{
+	const uint16_t n = (uint16_t)strlen(s);
+	// Outside the app nothing drains the queue, and the UART is the binary
+	// protocol's then.
+	if (!running || n > 255u || !UartRoom(n))
+		return;
+	while (*s)
+		uq[uqHead++] = (uint8_t)*s++;
+}
+#endif
+
+// A line on both ports (V2_SPEC 6).
+static void Out2(const char *s)
+{
+	DbgSend(s);
+#ifdef ENABLE_UART
+	UartLine(s);
+#endif
+}
+
+static void CsvLine(const char *s)
+{
+	if (!gAlertCfg.csv)
+		return;
+	Out2(s);
+	if (csvLines < 255u)
+		csvLines++;
 }
 
 // One buffer for every line this file builds. DbgSend returns only once the
@@ -254,6 +372,89 @@ static char *PutHex(char *d, const uint8_t *s, uint16_t n)
 	return d;
 }
 
+// A number that may be unknown: nothing at all when it is 0 (V2_SPEC 6: an
+// empty field is unknown). The epoch and the boot counter are 0 when unset.
+static char *PutOpt(char *d, uint32_t v)
+{
+	*d = 0;
+	if (v)
+		d += sprintf(d, "%lu", (unsigned long)v);
+	return d;
+}
+
+static const char *const hdrLines[] = {
+	"HDR,DEC,seq,epoch,uptime_ms,boot,id,name,kind,value,eng,unit,fmt,pol,inv,frame,"
+		"rssi,nf,sens,fade,burst_ms,payload_hex,payload_bin\r\n",
+	"HDR,BST,seq,epoch,uptime_ms,peak,nf,burst_ms,nframes,nbits,bits_hex\r\n",
+	"HDR,STA,epoch,uptime_ms,nf,rssi,sq,batt_mv,batt_pct,bursts,decodes,min_ok,"
+		"log_state,log_count,log_cap,stn_src\r\n",
+	"HDR,EVT,epoch,uptime_ms,code,detail\r\n",
+};
+
+// Always, whatever CSV OUT says: the console's CSV HDR asks for it by name.
+void ALERT_CsvHeader(void)
+{
+	sprintf(lb, "HDR,fw,%s,schema,2\r\n", BUILD_COMMIT);
+	Out2(lb);
+	for (uint8_t i = 0; i < sizeof(hdrLines) / sizeof(hdrLines[0]); i++)
+		Out2(hdrLines[i]);
+	csvLines = 0;
+}
+
+static void EmitEvt(const char *code, const char *detail)
+{
+	if (!gAlertCfg.csv)
+		return;
+	char *d = PutOpt(lb + sprintf(lb, "EVT,"), ALERT_Epoch());
+	sprintf(d, ",%lu,%s,%s\r\n", (unsigned long)ALERT_UptimeMs(), code, detail);
+	CsvLine(lb);
+}
+
+static const char *const fmtNames[4] = { "", "ABF", "EIF", "A2C" };
+
+uint8_t ALERT_FormatRecord(char *out, const char *type, uint32_t seq, const AlertRecord_t *r)
+{
+	char        name[ALERT_NAME_MAX + 1], eng[8];
+	uint8_t     kind = ALERT_KIND_NONE;
+	const char *unit = "";
+	char       *d;
+
+	CfgReady();                      // SNR REQ, when the console dumps the log outside the app
+	ALERTSTN_Lookup(r->id, name, sizeof(name), &kind);
+	for (d = name; *d; d++)
+		if (*d == ',')
+			*d = ' ';                // one field, whatever the table holds
+
+	// eng/unit as FormatValue shows them; a full-scale value is a dead or
+	// over-range sensor, i.e. no reading: left empty
+	eng[0] = 0;
+	if (r->value != ALERT_VALUE_FULL_SCALE) {
+		if (kind == ALERT_KIND_BATT) {
+			sprintf(eng, "%u.%u", r->value / 10u, r->value % 10u);
+			unit = "V";
+		} else {
+			sprintf(eng, "%u", r->value);
+			if (kind == ALERT_KIND_RAIN)
+				unit = "tips";
+		}
+	}
+
+	// sens = NF + SNR REQ, an estimate (V2_SPEC 4); fade = how far over it
+	const int sens = r->nf + (int)gAlertCfg.snr_req;
+
+	d = PutOpt(out + sprintf(out, "%s,%lu,", type, (unsigned long)seq), r->epoch);
+	d = PutOpt(d + sprintf(d, ",%lu,", (unsigned long)r->uptime_ms), r->boot);
+	d += sprintf(d, ",%u,%s,%s,%u,%s,%s,%s,%s,%u,%u,%d,%d,%d,%d,%u,%08lX,",
+	             r->id, name, ALERT_KindLabel(kind), r->value, eng, unit,
+	             fmtNames[r->fmt & 3u], (r->flags & ALERTREC_POL_STD) ? "STD" : "NEG",
+	             (r->flags & ALERTREC_INV) ? 1u : 0u, ALERTREC_FRAME(r->flags),
+	             r->rssi, r->nf, sens, r->rssi - sens, r->burst_ms, (unsigned long)r->payload);
+	for (uint8_t i = 0; i < 32u; i++)
+		*d++ = ((r->payload >> (31u - i)) & 1u) ? '1' : '0';
+	strcpy(d, "\r\n");
+	return (uint8_t)(d + 2 - out);
+}
+
 // ---------------------------------------------------------------------------
 // the receiver
 
@@ -264,19 +465,24 @@ enum {
 };
 static uint8_t  adcState;
 static bool     adcRunning;      // BurstStart called, BurstStop not yet
+static bool     adcDelayed;      // BurstStart owed once the amplifier has settled
 static uint8_t  confN, confOk;   // burst confirmation, first three qualifying bursts
 static uint8_t  adcBits[64];     // one burst at 300 baud: 512 bits is 1.7 s
 static uint16_t lastBits;        // bits the demodulator gave for the last burst
 
-// Only SPEAKER ON opens the path for now. SQL (on while the squelch is open)
-// arrives with V2 Phase B, after the decode rate with it is checked on air;
-// until then it behaves as OFF, exactly as MONITOR OFF did. When the census
-// found audio only with PA8 on, ALERTADC_BurstStart switches it on for the
-// burst and BurstStop puts it back, so the speaker is not left hissing between
-// bursts on the ADC's account.
+static const char *const adcStNames[5] = { "UNTESTED", "OFF", "CONFIRM", "ON", "REJECT" };
+
+// The speaker path (PA8, the audio amplifier) per SPEAKER: OFF never, ON
+// always, SQL while a transmission is open. Never off under a burst whose
+// census choice needs the amplifier for its audio: ALERTADC_BurstStart
+// switched it on for that burst and BurstStop puts it back, so the ADC owns
+// it until then, whatever SPEAKER says (V2_SPEC 5, "as today").
 static void AudioPath(void)
 {
-	if (gAlertCfg.speaker == ALERT_SPK_ON) AUDIO_AudioPathOn(); else AUDIO_AudioPathOff();
+	const bool want = gAlertCfg.speaker == ALERT_SPK_ON ||
+	                  (gAlertCfg.speaker == ALERT_SPK_SQL && txOpen) ||
+	                  (adcRunning && ALERTADC_ChoicePa8());
+	if (want) AUDIO_AudioPathOn(); else AUDIO_AudioPathOff();
 }
 
 // Apply a census choice with the amplifier off. The PA4B bias steps PA4 from
@@ -288,6 +494,13 @@ static void SetChoiceQuiet(uint8_t pin, bool pa8)
 	AUDIO_AudioPathOff();
 	ALERTADC_SetChoice(pin, pa8);
 	AudioPath();
+}
+
+static void CensusEvt(const char *state)
+{
+	char d[28];
+	sprintf(d, "%s pa=%u %s", ALERT_AudName(), ALERTADC_ChoicePa8() ? 1u : 0u, state);
+	EmitEvt("CENSUS", d);
 }
 
 // burst state
@@ -304,6 +517,11 @@ static bool     blocked;
 // the ADC's bits and a squelch flicker's being one burst are unchanged.
 #define DRAIN_MS       40u       // squelch lost -> BurstFinish
 #define BURST_MAX_MS   1500u     // longer than this is not an ALERT burst
+// SPEAKER=SQL switching the amplifier on at the squelch open puts its turn-on
+// step and pop on PA4. When BurstStart switches it on itself it skips 20 ms of
+// samples for exactly that (PA8_SETTLE_SAMPLES); here the sampling starts that
+// much later instead. nowMs moves in 10 ms steps, so 30 is 20-30 ms real.
+#define SPK_SETTLE_MS  30u
 
 // Plain receive with the AF at FM: the ADC route takes the demodulated audio
 // from PA4, and nothing else is needed from the chip. This is what the FSK
@@ -350,6 +568,27 @@ void ALERT_SettingsChanged(void)
 {
 	StoreConfig();
 	persistReq = true;
+}
+
+// ---------------------------------------------------------------------------
+// noise floor
+
+static void NfReseed(void)
+{
+	nfSeedN   = 0;
+	nfSeedSum = 0;
+}
+
+static void NfSample(void)
+{
+	if (nfSeedN < NF_SEED_N) {
+		nfSeedSum += rssiDbm;
+		if (++nfSeedN == NF_SEED_N)
+			nfQ16 = nfSeedSum * 65536 / NF_SEED_N;
+		return;
+	}
+	// truncating division: a symmetric dead band of 3000/65536 dB
+	nfQ16 += ((int32_t)rssiDbm * 65536 - nfQ16) / NF_ALPHA_DIV;
 }
 
 // ---------------------------------------------------------------------------
@@ -400,15 +639,43 @@ static int8_t ClampS8(int16_t v)
 	return (int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v));
 }
 
-// De-duplicate one burst's readings, apply CONFIRM and UNKNOWN, and turn what
-// is left into records: history, the ALERT, line, the voice.
-static void Deliver(const AlertReading_t *r, int n, int ninv0, uint16_t burstMs)
+// Into the log when LOG is on and the log usable, then out as a DEC line
+// carrying the log's sequence number (V2_SPEC 6), else the per-boot count.
+static void Record(const AlertRecord_t *rec)
 {
-	if (n <= 0)
-		return;
+	uint32_t seq = 0;
 
+	bootSeq++;
+	if (gAlertCfg.log && (seq = ALERTLOG_NextSeq()) != 0) {
+		const uint32_t t0 = SCHEDULER_Ticks10ms();
+		if (!ALERTLOG_Append(rec)) {
+			seq = 0;
+			if (!logErr) {
+				logErr = true;
+				EmitEvt("LOG", "APPEND FAIL");
+			}
+		}
+		// A page write is ~1 ms, but crossing into a new sector erases it
+		// first, tens of ms: a squelch edge first seen after that may be long
+		// past, exactly as after a settings save (see `blocked`).
+		if (SCHEDULER_Ticks10ms() - t0 > 1u)
+			blocked = true;
+	}
+	if (gAlertCfg.csv) {
+		ALERT_FormatRecord(lb, "DEC", seq ? seq : bootSeq, rec);
+		CsvLine(lb);
+	}
+}
+
+// De-duplicate one burst's readings, apply CONFIRM, and turn what is left into
+// records: history, log, DEC line, voice. Every frame is recorded whether its
+// address is in the table or not; UNKNOWN only decides what the screen shows
+// (V2_SPEC 3) and what is announced. Returns the records made.
+static uint8_t Deliver(const AlertReading_t *r, int n, int ninv0, uint16_t burstMs)
+{
 	uint8_t frame = 0;
-	uint8_t announced = 0;
+	bool    announced = false;
+
 	for (int i = 0; i < n; i++) {
 		// collapse repeats of the same reading inside one burst
 		bool dup = false;
@@ -424,13 +691,9 @@ static void Deliver(const AlertReading_t *r, int n, int ninv0, uint16_t burstMs)
 				continue;
 		}
 
-		char name[ALERT_NAME_MAX + 1];
-		const bool known = ALERTSTN_Lookup(r[i].id, name, sizeof(name), NULL);
-		if (!known) {
+		const bool known = ALERTSTN_Lookup(r[i].id, NULL, 0, NULL);
+		if (!known)
 			stats.unknown++;
-			if (!gAlertCfg.show_unknown)
-				continue;
-		}
 		stats.frames++;
 		decodesTotal++;
 
@@ -450,22 +713,26 @@ static void Deliver(const AlertReading_t *r, int n, int ninv0, uint16_t burstMs)
 		rec.payload   = r[i].payload;
 		frame++;
 		PushHistory(&rec);
+		Record(&rec);
+		if (known && burstPeak < minOk)
+			minOk = burstPeak;
 
-#ifdef ENABLE_UART
-		{
-			// both ports, as it always went: the UART's one line
-			snprintf(lb, sizeof(lb), "ALERT,%u,%u,%s,%d,%s\r\n", r[i].id, r[i].value,
-			         r[i].format == ALERT_FMT_EIF ? "EIF" : "ABF", burstPeak, name);
-			UART_Send(lb, strlen(lb));
-#ifdef ENABLE_USB
-			VCP_SendStr(lb);
-#endif
+		if (gAlertCfg.debug) {
+			// the X1 line, both ports as it always went
+			char name[ALERT_NAME_MAX + 1];
+			ALERTSTN_Lookup(r[i].id, name, sizeof(name), NULL);
+			sprintf(lb, "ALERT,%u,%u,%s,%d,%s\r\n", r[i].id, r[i].value,
+			        fmtNames[r[i].format & 3u], burstPeak, name);
+			Out2(lb);
 		}
-#endif
-		if (!announced++)
-			Announce(&hist[histHead]);
+		if (!announced && (known || gAlertCfg.show_unknown)) {
+			announced = true;
+			Announce(&rec);
+		}
 	}
-	redraw = true;
+	if (n > 0)
+		redraw = true;
+	return frame;
 }
 
 // The X line: one decoded frame, before de-duplication and the table rules.
@@ -478,6 +745,22 @@ static void EmitX(const AlertReading_t *r, bool inv)
 	DbgSend(lb);
 }
 
+// One qualifying burst, decoded or not. seq is the burst's number this boot:
+// bursts are not logged, so there is no log sequence to give it, and its
+// uptime_ms (the squelch close) is the DEC lines' own, which ties them to it.
+static void EmitBst(uint8_t nframes, uint16_t nbits, uint16_t dur)
+{
+	if (!gAlertCfg.csv)
+		return;
+	const uint16_t nb = (uint16_t)((nbits + 7u) / 8u);
+	char *d = PutOpt(lb + sprintf(lb, "BST,%u,", burstCount), ALERT_Epoch());
+	d += sprintf(d, ",%lu,%d,%d,%u,%u,%u,", (unsigned long)lostUp, burstPeak, ALERT_NoiseFloor(),
+	             dur, nframes, nbits);
+	d = PutHex(d, adcBits, nb < 60u ? nb : 60u);
+	strcpy(d, "\r\n");
+	CsvLine(lb);
+}
+
 // ---------------------------------------------------------------------------
 // burst end
 
@@ -488,12 +771,18 @@ static void BurstFinish(void)
 	uint16_t adcN = 0;
 	const bool     adcRan = adcRunning;
 	const uint32_t dur    = lostMs - openMs;
+	const uint8_t  st0    = adcState;
 
+	adcDelayed = false;              // closed before the amplifier settled: never sampled
 	if (adcRunning) {
 		adcN = ALERTADC_BurstStop(adcBits, (uint16_t)(sizeof(adcBits) * 8u));
 		adcRunning = false;
-		AudioPath();             // SPEAKER may have changed during the burst; it wins
 	}
+	// SPEAKER=SQL closes here rather than at the squelch edge: after
+	// BurstStop, so the amplifier's switch-off step never lands in samples.
+	// SPEAKER may also have changed during the burst; it wins.
+	txOpen = false;
+	AudioPath();
 	redraw = true;
 
 	// Qualifying: 100-1500 ms of open squelch, and with SQ GATE on a peak well
@@ -518,17 +807,19 @@ static void BurstFinish(void)
 	}
 	stats.inv += (uint16_t)(na - na0);
 
-	for (int i = 0; i < na; i++)
-		EmitX(&r[i], i >= na0);
+	if (gAlertCfg.debug) {
+		for (int i = 0; i < na; i++)
+			EmitX(&r[i], i >= na0);
 
-	if (adcRan && adcN) {
-		// The ADC's bits, one per ALERT bit, in the old A-line shape: that is
-		// what the A line always carried, 300 baud and one sample per bit.
-		const uint16_t nb = (uint16_t)((adcN + 7u) / 8u);
-		char *d = lb + sprintf(lb, "A %u 1 %d ", adcN, burstPeak);
-		d = PutHex(d, adcBits, nb < 40u ? nb : 40u);
-		strcpy(d, "\r\n");
-		DbgSend(lb);
+		if (adcRan && adcN) {
+			// The ADC's bits, one per ALERT bit, in the old A-line shape: that is
+			// what the A line always carried, 300 baud and one sample per bit.
+			const uint16_t nb = (uint16_t)((adcN + 7u) / 8u);
+			char *d = lb + sprintf(lb, "A %u 1 %d ", adcN, burstPeak);
+			d = PutHex(d, adcBits, nb < 40u ? nb : 40u);
+			strcpy(d, "\r\n");
+			DbgSend(lb);
+		}
 	}
 	if (adcRan && adcState == ADCST_CONFIRM) {
 		// Burst confirmation: both tones 10 dB over the census's idle level on
@@ -568,8 +859,11 @@ static void BurstFinish(void)
 			}
 		}
 	}
+	if (adcState != st0)
+		CensusEvt(adcStNames[adcState]);
 
-	Deliver(r, na, na0, (uint16_t)dur);
+	const uint8_t nrec = Deliver(r, na, na0, (uint16_t)dur);
+	EmitBst(nrec, adcN, (uint16_t)dur);
 }
 
 // ---------------------------------------------------------------------------
@@ -580,13 +874,23 @@ static void BurstOpen(void)
 	openMs       = nowMs;
 	burstPeak    = rssiDbm;
 	burstTainted = false;
+	txOpen       = true;
 	stats.sqcap++;
 	if (adcState == ADCST_CONFIRM || adcState == ADCST_ON) {
+		if (gAlertCfg.speaker == ALERT_SPK_SQL && !ALERTADC_ChoicePa8()) {
+			// The speaker opens now, the sampling once the amplifier has
+			// settled (SPK_SETTLE_MS, RxPoll). A choice that needs PA8 has it
+			// switched by BurstStart, which settles it itself.
+			AUDIO_AudioPathOn();
+			adcDelayed = true;
+			return;
+		}
 		// TIM3 runs only while the squelch is open: the sampler's own RF
 		// interference is what made fagci drop the same pipeline
 		ALERTADC_BurstStart();
 		adcRunning = true;
 	}
+	AudioPath();
 }
 
 // Nothing that blocks - a redraw, a USB line, a flash write - may run while a
@@ -622,6 +926,12 @@ static void RxPoll(void)
 	if (sqOpen && rssiDbm > burstPeak)
 		burstPeak = rssiDbm;
 
+	if (adcDelayed && sqOpen && (uint32_t)(nowMs - openMs) >= SPK_SETTLE_MS) {
+		adcDelayed = false;
+		ALERTADC_BurstStart();
+		adcRunning = true;
+	}
+
 	// Bounded. An unbounded "while (REG_0C & 1)" once froze the whole radio when
 	// writing REG_02 did not clear the pending flag.
 	for (uint8_t guard = 0; guard < 16 && (BK4819_ReadRegister(BK4819_REG_0C) & 1u); guard++) {
@@ -648,7 +958,9 @@ static void RunCensus(void)
 	// reaches the speaker (see SetChoiceQuiet). RxArm below restores SPEAKER.
 	AUDIO_AudioPathOff();
 	DFU_WatchdogKick();
-	ok = ALERTADC_Census(DbgSend);
+	// Its P/PT/AUD lines, and the P src=BURST lines BurstStop sends through the
+	// same callback afterwards, are DEBUG lines; EVT CENSUS carries the result.
+	ok = ALERTADC_Census(DbgLine);
 	DFU_WatchdogKick();
 	censusBusy = false;
 	censusReq  = false;              // after, so the menu row reads PENDING throughout
@@ -670,6 +982,7 @@ static void RunCensus(void)
 	}
 	confN = confOk = 0;
 	RxArm();                         // the census reprogrammed the BK4819
+	CensusEvt(adcStNames[adcState]);
 	redraw = true;
 }
 
@@ -678,8 +991,15 @@ static void RunCensus(void)
 
 int8_t ALERT_NoiseFloor(void)
 {
-	// the slow minimum for now; V2 section 4's average replaces it
-	return ClampS8(rssiFloor);
+	int32_t q;
+	if (nfSeedN >= NF_SEED_N)
+		q = nfQ16;
+	else if (nfSeedN)
+		q = nfSeedSum * 65536 / nfSeedN;     // still seeding: the mean so far
+	else
+		return ClampS8(rssiDbm);             // nothing measured yet
+	// to the nearest dB; >> on a negative value is arithmetic in GCC
+	return ClampS8((int16_t)((q + 32768) >> 16));
 }
 
 int8_t   ALERT_Rssi(void)        { return ClampS8(rssiDbm); }
@@ -701,8 +1021,18 @@ uint32_t ALERT_Epoch(void)
 
 void ALERT_SetEpoch(uint32_t epoch)
 {
+	const uint32_t was = ALERT_Epoch();
+	char d[20];
+
 	epochTicks = SCHEDULER_Ticks10ms();
 	epochBase  = epoch;
+	// the step says how far the clock had drifted since it was last set
+	if (was)
+		sprintf(d, "STEP %ld", (long)(epoch - was));
+	else
+		strcpy(d, "SET");
+	CfgReady();
+	EmitEvt("CLOCK", d);
 }
 
 uint8_t ALERT_HistoryCount(void)
@@ -735,18 +1065,18 @@ const char *ALERT_AudName(void)
 }
 
 // ---------------------------------------------------------------------------
-// settings rows
+// settings rows (V2_SPEC 5, in its order)
 
 enum {
-	SET_POLARITY, SET_VOICE, SET_GATE, SET_UNKNOWN, SET_CONFIRM, SET_MONITOR,
-	SET_MODE, SET_CENSUS, SET_FREQ, SET_SQL, SET_N
+	SET_VOICE, SET_SPEAKER, SET_CSV, SET_LOG, SET_UNKNOWN, SET_CONFIRM, SET_GATE,
+	SET_SNR, SET_DEBUG, SET_MODE, SET_CENSUS, SET_FREQ, SET_SQL, SET_N
 };
 
 // "MDM MODE" and "SQ GATE" are grepped for by CI as proof the app is in the
 // image, so they keep their names whatever the rows now do.
 static const char *const setNames[SET_N] = {
-	"POLARITY", "VOICE", "SQ GATE", "UNKNOWN", "CONFIRM", "MONITOR",
-	"MDM MODE", "CENSUS",
+	"VOICE", "SPEAKER", "CSV OUT", "LOG", "UNKNOWN", "CONFIRM", "SQ GATE",
+	"SNR REQ", "DEBUG", "MDM MODE", "CENSUS",
 	// in enum order: these two were once swapped, so FREQ stepped the squelch
 	"FREQ MHz", "SQL LEVEL"
 };
@@ -761,18 +1091,24 @@ const char *ALERT_SetName(uint8_t row)
 	return row < SET_N ? setNames[row] : "";
 }
 
-// values are at most eight characters, see the settings view
+// Values are at most eight characters (see the settings view), and a
+// two-state row reads exactly OFF/ON or its own two words, so the console can
+// match a SET against them.
 void ALERT_SetValue(uint8_t row, char *s)
 {
 	static const char *const onoff[2] = { "OFF", "ON" };
-	static const char *const pol[3]   = { "NEG", "STD", "ANY" };
+	static const char *const spk[3]   = { "OFF", "SQL", "ON" };
+	CfgReady();
 	switch (row) {
-		case SET_POLARITY: strcpy(s, pol[gAlertCfg.polarity]); break;
 		case SET_VOICE:    strcpy(s, onoff[gAlertCfg.voice]); break;
-		case SET_GATE:     strcpy(s, onoff[gAlertCfg.gate]); break;
+		case SET_SPEAKER:  strcpy(s, spk[gAlertCfg.speaker % 3u]); break;
+		case SET_CSV:      strcpy(s, onoff[gAlertCfg.csv]); break;
+		case SET_LOG:      strcpy(s, onoff[gAlertCfg.log]); break;
 		case SET_UNKNOWN:  strcpy(s, gAlertCfg.show_unknown ? "SHOW" : "HIDE"); break;
 		case SET_CONFIRM:  strcpy(s, gAlertCfg.confirm ? "2 COPIES" : "OFF"); break;
-		case SET_MONITOR:  strcpy(s, onoff[gAlertCfg.speaker == ALERT_SPK_ON]); break;
+		case SET_GATE:     strcpy(s, onoff[gAlertCfg.gate]); break;
+		case SET_SNR:      sprintf(s, "%u", gAlertCfg.snr_req); break;
+		case SET_DEBUG:    strcpy(s, onoff[gAlertCfg.debug]); break;
 		case SET_MODE:     strcpy(s, "ADC"); break;    // the only demodulator left
 		case SET_CENSUS:
 			if (ALERT_CensusPending())           strcpy(s, "PENDING");
@@ -787,6 +1123,19 @@ void ALERT_SetValue(uint8_t row, char *s)
 		}
 		default: s[0] = 0; break;
 	}
+}
+
+// EVT SET: "NAME=VALUE", the name as the console spells it (spaces -> _).
+static void SetEvt(uint8_t row)
+{
+	char d[20], *p;
+	strcpy(d, setNames[row]);
+	for (p = d; *p; p++)
+		if (*p == ' ')
+			*p = '_';
+	*p++ = '=';
+	ALERT_SetValue(row, p);
+	EmitEvt("SET", d);
 }
 
 static void ApplySquelch(void)
@@ -818,22 +1167,35 @@ static void StepSquelch(int dir)
 // act on the receiver refuse.
 bool ALERT_SetStep(uint8_t row, int dir)
 {
+	CfgReady();
 	switch (row) {
-		case SET_POLARITY: gAlertCfg.polarity = (uint8_t)((gAlertCfg.polarity + 3 + dir) % 3); break;
 		case SET_VOICE:    gAlertCfg.voice = !gAlertCfg.voice; break;
-		case SET_GATE:     gAlertCfg.gate = !gAlertCfg.gate; break;
-		case SET_UNKNOWN:  gAlertCfg.show_unknown = !gAlertCfg.show_unknown; break;
-		case SET_CONFIRM:  gAlertCfg.confirm = !gAlertCfg.confirm; break;
-		case SET_MONITOR:
-			// ON and not-ON (SQL, the default, which is off until Phase B wires
-			// it) are the two states this row has always had. Only the audio
-			// path moves: the AF stays at FM for the ADC.
-			gAlertCfg.speaker = (gAlertCfg.speaker == ALERT_SPK_ON) ? ALERT_SPK_SQL : ALERT_SPK_ON;
+		case SET_SPEAKER:
+			// OFF -> SQL -> ON going up. Only the audio path moves: the AF
+			// stays at FM for the ADC.
+			gAlertCfg.speaker = (uint8_t)((gAlertCfg.speaker + 3 + dir) % 3);
 			if (running)
 				AudioPath();
 			break;
+		case SET_CSV:
+			gAlertCfg.csv = !gAlertCfg.csv;
+			csvLines = 200;              // a host that just switched it on gets the HDR block first
+			break;
+		case SET_LOG:      gAlertCfg.log = !gAlertCfg.log; break;
+		case SET_UNKNOWN:  gAlertCfg.show_unknown = !gAlertCfg.show_unknown; break;
+		case SET_CONFIRM:  gAlertCfg.confirm = !gAlertCfg.confirm; break;
+		case SET_GATE:     gAlertCfg.gate = !gAlertCfg.gate; break;
+		case SET_SNR: {
+			const int v = (int)gAlertCfg.snr_req + dir;
+			if (v < (int)ALERT_SNR_MIN || v > (int)ALERT_SNR_MAX)
+				return false;
+			gAlertCfg.snr_req = (uint8_t)v;
+			break;
+		}
+		case SET_DEBUG:    gAlertCfg.debug = !gAlertCfg.debug; break;
 		case SET_CENSUS:
-			if (!running)
+			// UP re-runs it (V2_SPEC 5); DOWN does nothing
+			if (!running || dir <= 0)
 				return false;
 			censusReq = true;
 			break;
@@ -850,6 +1212,7 @@ bool ALERT_SetStep(uint8_t row, int dir)
 			gRequestSaveVFO = true;              // so it survives leaving the app
 			RADIO_SetupRegisters(true);
 			RxArm();
+			NfReseed();                          // another channel, another floor
 			break;
 		}
 		case SET_SQL:
@@ -860,37 +1223,150 @@ bool ALERT_SetStep(uint8_t row, int dir)
 		default: return false;                   // SET_MODE is read-only
 	}
 	redraw = true;
+	// In the app the EVT waits for a quiet moment (and a held key's steps
+	// coalesce into one line with the final value); outside it there is no
+	// burst to protect.
+	if (running)
+		setDirty |= (uint16_t)(1u << row);
+	else
+		SetEvt(row);
 	return true;
 }
 
 // ---------------------------------------------------------------------------
 // keys
 
-// The keys that act on the receiver, from the main view. Everything else -
-// view changes, the settings view's own keys - is the UI's.
-static void OnKey(KEY_Code_t key)
+#ifdef ENABLE_VOICE
+// KEY_0: the selected entry again, from where the list takes it (alert_ui.c's
+// UseLog) - the log while logging and not empty, else the RAM ring.
+// ALERTUI_Selected is 0 at the top of the list even when UNKNOWN=HIDE skips
+// the newest records there, so this takes the first shown record from it on,
+// as the list does, and gives up after as many as the list's own search.
+static void Replay(void)
 {
+	AlertRecord_t  rec;
+	const bool     useLog = gAlertCfg.log && !strcmp(ALERTLOG_State(), "OK") && ALERTLOG_Count();
+	uint32_t       back   = ALERTUI_Selected();
+
+	for (uint8_t n = 0;; n++, back++) {
+		if (useLog) {
+			if (!ALERTLOG_ReadBack(back, &rec, NULL))
+				return;
+		} else {
+			const AlertRecord_t *h = back < 255u ? ALERT_History((uint8_t)back) : NULL;
+			if (!h)
+				return;
+			rec = *h;
+		}
+		if (gAlertCfg.show_unknown || (rec.flags & ALERTREC_TABLE))
+			break;
+		if (n >= 127u)
+			return;
+	}
+	Announce(&rec);
+}
+#endif
+
+// V2_SPEC 3. alert.c keeps the keys that act on the receiver or the app -
+// EXIT, STAR, F, 0 - on the list and the detail view; everything else (MENU,
+// UP/DOWN, 1, and every key in the settings view) is the UI's. `held` is an
+// auto-repeat of UP/DOWN (see the loop).
+static void OnKey(KEY_Code_t key, bool held)
+{
+	const uint8_t view = ALERTUI_View();
+
 	BACKLIGHT_TurnOn();
 	redraw = true;
 
-	if (ALERTUI_View() == ALERT_VIEW_MAIN) {
+	if (!held && view != ALERT_VIEW_SETTINGS) {
 		switch (key) {
-			case KEY_EXIT: running = false; return;
-			case KEY_STAR: gAlertCfg.voice = !gAlertCfg.voice; StoreConfig(); return;
-			case KEY_F:    ALERT_SetStep(SET_MONITOR, 0); return;
-			case KEY_UP:   StepSquelch(+1); return;
-			case KEY_DOWN: StepSquelch(-1); return;
+			case KEY_EXIT:
+				if (view != ALERT_VIEW_MAIN)
+					break;                   // detail -> list is the UI's
+				if (ALERTUI_Selected()) {
+					// scrolled: back to the top first, and only if the UI did
+					// not do that, out
+					ALERTUI_Key(KEY_EXIT, false);
+					if (!ALERTUI_Selected())
+						return;
+				}
+				running = false;
+				return;
+			case KEY_STAR:
+				ALERT_SetStep(SET_VOICE, +1);
+				ALERT_SettingsChanged();
+				return;
+			case KEY_F:
+				ALERT_SetStep(SET_SPEAKER, +1);
+				ALERT_SettingsChanged();
+				return;
 			case KEY_0:
-				histCount = 0;
-				memset(&stats, 0, sizeof(stats));
+#ifdef ENABLE_VOICE
+				Replay();
+#endif
 				return;
-			case KEY_5:
-				if (histCount) Announce(&hist[histHead]);
-				return;
-			default: break;
+			default:
+				break;
 		}
 	}
-	ALERTUI_Key(key, false);
+	ALERTUI_Key(key, held);
+}
+
+// UP/DOWN held: a first repeat after 500 ms, then every 100 ms - a log holds
+// thousands of entries, and FREQ steps 12.5 kHz at a time.
+#define KEY_REPEAT_START 50u     // 10 ms ticks
+#define KEY_REPEAT_EVERY 10u
+
+// ---------------------------------------------------------------------------
+// periodic lines
+
+static void EmitSta(void)
+{
+	char *d = PutOpt(lb + sprintf(lb, "STA,"), ALERT_Epoch());
+	d += sprintf(d, ",%lu,%d,%d,%u,%u,%u,%u,%lu,", (unsigned long)ALERT_UptimeMs(),
+	             ALERT_NoiseFloor(), ALERT_Rssi(), sqOpen ? 1u : 0u,
+	             gBatteryVoltageAverage * 10u, BATTERY_VoltsToPercent(gBatteryVoltageAverage),
+	             burstCount, (unsigned long)decodesTotal);
+	if (minOk != MINOK_NONE)
+		d += sprintf(d, "%d", minOk);
+	sprintf(d, ",%s,%lu,%lu,%s\r\n", ALERTLOG_State(), (unsigned long)ALERTLOG_Count(),
+	        (unsigned long)ALERTLOG_Capacity(), ALERTSTN_Source());
+	CsvLine(lb);
+}
+
+// The modal loop bypasses app.c's battery sampling, which would leave the
+// status-line icon and the STA line frozen at the entry reading (foxhunt.c
+// does the same). Never while TIM3 is triggering the ADC (alert_adc.h).
+static void BatteryRefresh(void)
+{
+	if (ALERTADC_IsSampling())
+		return;
+	BOARD_ADC_GetBatteryInfo(&gBatteryVoltages[gBatteryVoltageIndex++], &gBatteryCurrent);
+	if (gBatteryVoltageIndex > 3)
+		gBatteryVoltageIndex = 0;
+	BATTERY_GetReadings(false);
+}
+
+// What goes out at app entry: the HDR block and the state of things.
+static void EntryLines(void)
+{
+	static const char *const rst[4] = { "POR", "SW", "WD", "FAULT" };
+	char d[48];
+
+	if (gAlertCfg.csv)
+		ALERT_CsvHeader();
+	if (!bootSaid) {
+		bootSaid = true;
+		sprintf(d, "%s %u", rst[DFU_ResetReason() & 3u], ALERTLOG_Boot());
+		EmitEvt("BOOT", d);
+	}
+	sprintf(d, "%s %u", ALERTSTN_Source(), ALERTSTN_Count());
+	EmitEvt("STN", d);
+	sprintf(d, "%s %lu/%lu", ALERTLOG_State(), (unsigned long)ALERTLOG_Count(),
+	        (unsigned long)ALERTLOG_Capacity());
+	EmitEvt("LOG", d);
+	if (adcState == ADCST_ON)
+		CensusEvt("SAVED");          // no census this entry: the choice that decoded before
 }
 
 // ---------------------------------------------------------------------------
@@ -913,12 +1389,16 @@ void APP_RunAlert(void)
 	dbgIrqCount = 0;
 	// burstCount is not reset: with the boot line it keys every X and A line,
 	// and a second visit to the app in one power-up must not reuse numbers.
+	// Nor are bootSeq and minOk: both are "this boot" (V2_SPEC 4, 6).
 	sqOpen = false; sqPrev = false; draining = false;
 	rssiFloor = 0; burstPeak = -127; lastPeak = -127; lastBits = 0;
 	nowMs = 0; tick = 0;
 	entry = ENTRY_SETTLE; entryMs = 0; censusBusy = false; censusReq = false;
-	adcState = ADCST_UNTESTED; adcRunning = false; confN = 0; confOk = 0;
-	blocked = false; burstTainted = false;
+	adcState = ADCST_UNTESTED; adcRunning = false; adcDelayed = false; confN = 0; confOk = 0;
+	blocked = false; burstTainted = false; txOpen = false;
+	openMs = 0; lostMs = 0;          // lostMs = 0: the floor skips the first 500 ms too
+	NfReseed();
+	staMs = 0; setDirty = 0; logErr = false;
 	ALERTUI_Reset();
 	ALERTSTN_Init();
 	(void)ALERTLOG_Init();
@@ -955,6 +1435,8 @@ void APP_RunAlert(void)
 	// Receiving from the start so the floor settles; bursts during the settle
 	// are seen but not decoded.
 	RxArm();
+	// After RxArm: the UART queue checks the squelch, which needs the chip in RX.
+	EntryLines();
 
 	while (running) {
 		DFU_WatchdogKick();
@@ -966,12 +1448,23 @@ void APP_RunAlert(void)
 		// on USB for as long as this app is open.
 		UART_ServiceCommands();
 #endif
-		ALERTCON_Poll();
+#ifdef ENABLE_UART
+		UartDrain();
+#endif
+		{
+			// A console command, or the log pre-erase the console runs, can
+			// hold the loop for up to ~300 ms (a sector erase): a squelch edge
+			// first seen after that is marked like one after a settings save.
+			const uint32_t t0 = SCHEDULER_Ticks10ms();
+			ALERTCON_Poll();
+			if (SCHEDULER_Ticks10ms() - t0 > 1u)
+				blocked = true;
+		}
 		dbgRawKey = (int16_t)key;
 		dbgRawPtt = GPIO_IsPttPressed() ? 1u : 0u;
 		if (key != lastKey) {
 			if (key != KEY_INVALID && key != KEY_PTT)
-				OnKey(key);
+				OnKey(key, false);
 			lastKey     = key;
 			keyHeld10ms = 0;   // a new key starts its own hold timer
 		}
@@ -1011,7 +1504,7 @@ void APP_RunAlert(void)
 		}
 #endif
 
-		// housekeeping every 10 ms: clock, RSSI, hold timers; screen and USB
+		// housekeeping every 10 ms: clock, RSSI, hold timers; screen and lines
 		// only while the squelch is shut
 		if (gNextTimeslice) {
 			const bool quiet = Quiet();
@@ -1020,9 +1513,9 @@ void APP_RunAlert(void)
 			BACKLIGHT_Update();
 			ALERTUI_Tick10ms();
 
-			// Hold-to-leave timers, in real 10 ms ticks. Counting loop passes
-			// made "800 ms" of PTT about 160 ms, and ordinary presses dropped the
-			// user out of the app.
+			// Hold timers, in real 10 ms ticks. Counting loop passes made
+			// "800 ms" of PTT about 160 ms, and ordinary presses dropped the
+			// user out of the app. UP/DOWN repeat instead of leaving.
 			if (dbgRawPtt) {
 				if (++pttHeld10ms > 50)     // 500 ms
 					running = false;
@@ -1030,8 +1523,13 @@ void APP_RunAlert(void)
 				pttHeld10ms = 0;
 			}
 			if (dbgRawKey != (int16_t)KEY_INVALID) {
-				if (++keyHeld10ms > 250)    // 2.5 s
+				++keyHeld10ms;
+				if (dbgRawKey == (int16_t)KEY_UP || dbgRawKey == (int16_t)KEY_DOWN) {
+					if (keyHeld10ms >= KEY_REPEAT_START && (keyHeld10ms % KEY_REPEAT_EVERY) == 0)
+						OnKey((KEY_Code_t)dbgRawKey, true);
+				} else if (keyHeld10ms > 250) {   // 2.5 s
 					running = false;
+				}
 			} else {
 				keyHeld10ms = 0;
 			}
@@ -1043,19 +1541,39 @@ void APP_RunAlert(void)
 				rssiFloor = rssiDbm;
 			if ((++tick % 500) == 0 && rssiFloor < 0)
 				rssiFloor++;          // let the floor drift back up over 5 s steps
+			if (!sqOpen && !draining && (uint32_t)(nowMs - lostMs) >= NF_HOLD_MS)
+				NfSample();
 
 			if ((tick % 10) == 0 && quiet)
 				ALERTUI_DrawStatus();
+			if (quiet) {
+				if ((tick % 100) == 0)
+					BatteryRefresh();
+				if (setDirty) {
+					for (uint8_t row = 0; row < SET_N; row++)
+						if (setDirty & (1u << row))
+							SetEvt(row);
+					setDirty = 0;
+				}
+				if ((uint32_t)(nowMs - staMs) >= 10000u) {
+					staMs = nowMs;
+					EmitSta();
+				}
+				if (csvLines >= 200u && gAlertCfg.csv)
+					ALERT_CsvHeader();   // for a host that connected since the last one
+			}
 			if ((tick % 50) == 0 && quiet) {
 				// The ST7565 loses its register state when the BK4819 changes RF
 				// state; this fork re-sends the init list after TX and after
 				// sleep-wake for exactly that reason.
 				ST7565_FixInterfGlitch();
 				redraw = true;
-				sprintf(lb, "D I%u F%u G%u B%u R%d Q%u N%u f%d p%d V%u C%u\r\n",
-				        dbgIrqCount, stats.frames, stats.gated, lastBits, rssiDbm,
-				        sqOpen ? 1u : 0u, burstCount, rssiFloor, lastPeak, stats.inv, stats.sqcap);
-				DbgSend(lb);
+				if (gAlertCfg.debug) {
+					sprintf(lb, "D I%u F%u G%u B%u R%d Q%u N%u f%d p%d V%u C%u\r\n",
+					        dbgIrqCount, stats.frames, stats.gated, lastBits, rssiDbm,
+					        sqOpen ? 1u : 0u, burstCount, rssiFloor, lastPeak, stats.inv, stats.sqcap);
+					DbgSend(lb);
+				}
 			}
 		}
 
@@ -1069,8 +1587,13 @@ void APP_RunAlert(void)
 
 	// leave: ADC off, radio back to normal. The amplifier goes off first:
 	// Shutdown drops the PA4B bias, and RADIO_SetupRegisters would only switch
-	// PA8 off after that step had reached the speaker.
+	// PA8 off after that step had reached the speaker. RADIO_SetupRegisters
+	// then leaves the audio as the radio keeps it between receptions (path
+	// off, gEnableSpeaker false, AF per the VFO's modulation), whatever
+	// SPEAKER was doing here.
 	AUDIO_AudioPathOff();
+	adcDelayed = false;
+	txOpen     = false;
 	if (adcRunning) {
 		(void)ALERTADC_BurstStop(adcBits, 0);
 		adcRunning = false;
@@ -1080,6 +1603,12 @@ void APP_RunAlert(void)
 	BK4819_WriteRegister(BK4819_REG_02, 0);
 	Persist();
 	RADIO_SetupRegisters(true);
+#ifdef ENABLE_UART
+	// what is still queued goes out now (<= 66 ms), or not at all: outside the
+	// app the UART is the binary protocol's
+	(void)UartRoom(255u);
+	uqTail = uqHead;
+#endif
 	ST7565_FixInterfGlitch();   // leave the controller in a state the main UI can draw on
 	gRequestDisplayScreen = DISPLAY_MAIN;
 	gUpdateStatus  = true;

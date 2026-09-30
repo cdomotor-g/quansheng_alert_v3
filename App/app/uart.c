@@ -683,7 +683,13 @@ bool UART_IsCommandAvailable(uint32_t Port)
 #if defined(ENABLE_USB)
     else if (Port == UART_PORT_VCP)
     {
-        DmaLength = VCP_RxBufPointer;
+        // The USB driver leaves its write index at sizeof(VCP_RxBuf), one past
+        // the end, when a packet fills the ring exactly; the next packet wraps
+        // it. Read that as 0: otherwise the scan below never meets it, parks
+        // the read index at 256 and later skips index 0 - the first byte of
+        // any frame that lands there. The ALERT console's text makes that
+        // landing likelier, so this is part of sharing the port with it.
+        DmaLength = VCP_RxBufPointer % sizeof(VCP_RxBuf);
         ReadBuf = VCP_RxBuf;
         ReadBufSize = sizeof(VCP_RxBuf);
         pReadPointer = &VCP_ReadIndex;

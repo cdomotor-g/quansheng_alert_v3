@@ -24,6 +24,12 @@ The ALERT-X1 build adds B L C H X Y F P PT AUD Z G K lines (X1_PLAN.md s8).
 They are shown as they arrive, with X decodes flagged and H hex abbreviated;
 judging them is sweep_judge.py's job, and logging them is radio.py's.
 
+V2 replaced the ALERT, line with CSV records (docs/ALERT_SERIAL.md), and the
+D and A lines only come with DEBUG=ON. A DEC line is shown as the reading it
+carries. A BST line carries the burst's bits, so it is re-decoded here like
+an A line, in both senses as the firmware tries them. The other records are
+shown verbatim. alertterm.py live is the fuller V2 client.
+
     python tools/alert/alertmon.py COM5 [seconds]
 
 Passive: sends nothing to the radio, apart from re-asserting DTR after 10 s of
@@ -168,9 +174,35 @@ def bit_stats(data, nbits):
     return ones, trans, (max(runs) if runs else 0)
 
 
+def handle_v2(stamp, txt):
+    """DEC and BST records (V2). alertterm owns the field lists; importing it
+    here, not at the top, keeps this module's import cheap for the log tools."""
+    import alertterm
+    r = alertterm.parse_record(txt)
+    if r.type == 'DEC':
+        print('[%s] >>> %s' % (stamp, alertterm.format_dec(r).strip()))
+        return
+    try:
+        data = bytes.fromhex(r.get('bits_hex', ''))
+        nbits = min(r.num('nbits') or 0, len(data) * 8)
+    except ValueError:
+        print('[%s] unparsed: %r' % (stamp, txt))
+        return
+    print('[%s] BURST %s: %d bits, peak %s dBm, nf %s, %s ms, %s frame(s) decoded by the radio'
+          % (stamp, r.get('seq'), nbits, r.get('peak'), r.get('nf'), r.get('burst_ms'),
+             r.get('nframes')))
+    if nbits:
+        for inv, buf in ((0, data), (1, bytes(b ^ 0xFF for b in data))):
+            for (fmt, a, d), pos, pol in scan_all(buf, nbits):
+                print('             >>> %s id=%d value=%d  bit %d  pol=%s inv=%d' %
+                      (fmt, a, d, pos, 'NEG' if pol == POL_NEGATIVE else 'STD', inv))
+
+
 def handle(txt):
     stamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-    if txt.startswith('A '):
+    if txt.startswith(('DEC,', 'BST,')):
+        handle_v2(stamp, txt)
+    elif txt.startswith('A '):
         parts = txt.split()
         try:
             nbits, gated, rssi = int(parts[1]), int(parts[2]), int(parts[3])

@@ -126,6 +126,17 @@ const char *ALERT_SetName(uint8_t row);
 void        ALERT_SetValue(uint8_t row, char *out);   // out: >= 9 bytes
 bool        ALERT_SetStep(uint8_t row, int dir);      // false: not changed (see above)
 
+// CSV (V2_SPEC 6), shared with the console so its CSV HDR and LOG DUMP match
+// what the app emits. Every line is at most ALERT_LINE_MAX characters, CRLF
+// included.
+#define ALERT_LINE_MAX 200u
+// The HDR block, on USB (and the UART while the app runs), whatever CSV OUT says.
+void    ALERT_CsvHeader(void);
+// One record in the DEC layout, "<type>,<seq>,<epoch>,...,<payload_bin>\r\n":
+// type "DEC" or "LOG", seq as the log gave it. out: >= ALERT_LINE_MAX + 1
+// bytes. Returns the length. Usable outside the app.
+uint8_t ALERT_FormatRecord(char *out, const char *type, uint32_t seq, const AlertRecord_t *r);
+
 // ---------------------------------------------------------------------------
 // alert_ui.c
 
@@ -137,6 +148,13 @@ void    ALERTUI_Tick10ms(void);                  // [spec] marquee, idle snap-ba
 void    ALERTUI_DrawStatus(void);                // status line only (every 100 ms)
 uint8_t ALERTUI_View(void);                      // ALERT_VIEW_*
 void    ALERTUI_Reset(void);                     // app entry: main view, top of the list
+// The entry the list (or the detail view) is on, as entries back from the
+// newest in the list's own source (the log when usable, else ALERT_History):
+// 0 = the top. alert.c keeps EXIT and KEY_0 on the list, and asks this so that
+// EXIT on a scrolled list is forwarded to ALERTUI_Key (snap back to the top)
+// instead of leaving, and KEY_0 replays the selected entry. 0 at the top even
+// when UNKNOWN=HIDE skips the newest records there (the replay skips them too).
+uint32_t ALERTUI_Selected(void);
 
 #endif // ENABLE_ALERT
 

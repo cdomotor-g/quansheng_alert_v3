@@ -7,7 +7,7 @@ holds DTR, and a send that times out clears its DTR flag: from then on it is
 silent until the host asserts DTR again. So the logger re-asserts DTR after 10 s
 without a byte, which is what turned several past sessions into empty logs.
 
-    python tools/alert/radio.py log [--minutes N]        # tools/alert/logs/x1-*.log
+    python tools/alert/radio.py log [--minutes N]        # tools/alert/logs/alert-*.log
     python tools/alert/radio.py bk-read 0x58 0x5C 0x0B   # 0x0601
     python tools/alert/radio.py bk-write 0x72 0x3065     # 0x0602
     python tools/alert/radio.py dfu-check                # 0x05E1: the bootloader guard
@@ -16,6 +16,11 @@ without a byte, which is what turned several past sessions into empty logs.
 
 The X1 sweep commands (0x0A01 ARR_SET, 0x0A02 SWEEP_CTL, 0x0A03 POKE_LIST)
 went with the FSK sweep in V2; the firmware ignores those IDs now.
+
+V2 streams CSV records (HDR, DEC, BST, STA, EVT; docs/ALERT_SERIAL.md). They
+are logged like every other line. A command's reply here leaves them out
+unless -v, as it does the D heartbeats. The V2 text console (TIME, LOG,
+STN, SCREEN...) is alertterm.py's job, not this tool's.
 
 Windows lets one process hold a COM port. While `log` runs it owns the port,
 so the other subcommands hand their frame to it over 127.0.0.1 and it sends
@@ -186,7 +191,7 @@ class Logger:
         self.clients = []           # [socket, expiry]
         os.makedirs(LOG_DIR, exist_ok=True)
         self.path = args.out or os.path.join(
-            LOG_DIR, 'x1-%s.log' % datetime.now().strftime('%Y%m%d-%H%M%S'))
+            LOG_DIR, 'alert-%s.log' % datetime.now().strftime('%Y%m%d-%H%M%S'))
         self.fh = open(self.path, 'a', encoding='ascii', errors='replace', newline='\r\n')
 
     def emit(self, txt, echo=True):
@@ -433,11 +438,15 @@ def is_ack(item):
     return item[0] == 'line' and (item[1] == 'K' or item[1].startswith('K '))
 
 
+# V2's CSV records: the stream, never a reply to a command (docs/ALERT_SERIAL.md)
+STREAM_PREFIXES = ('D ', 'H ', 'HDR,', 'DEC,', 'BST,', 'STA,', 'EVT,')
+
+
 def show(items, all_lines):
-    """Print the reply, not the heartbeat stream it arrived in."""
+    """Print the reply, not the heartbeat/record stream it arrived in."""
     for item in items or ():
         txt = item_text(item)
-        if all_lines or item[0] == 'pkt' or not txt.startswith(('D ', 'H ')):
+        if all_lines or item[0] == 'pkt' or not txt.startswith(STREAM_PREFIXES):
             print(txt)
 
 
@@ -548,12 +557,13 @@ def main(argv=None):
     ap.add_argument('--port', help='COM port (default: the first with VID 36B7)')
     ap.add_argument('--direct', action='store_true',
                     help='open the port even if a logger is running (it will fail on Windows)')
-    ap.add_argument('-v', '--verbose', action='store_true', help='also print D and H lines')
+    ap.add_argument('-v', '--verbose', action='store_true',
+                    help='also print the stream: D and H lines, V2 CSV records')
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     p = sub.add_parser('log', help='log the stream to tools/alert/logs/')
     p.add_argument('--minutes', type=float, default=0, help='stop after N minutes (default: Ctrl-C)')
-    p.add_argument('--out', help='log file (default: logs/x1-<date>-<time>.log)')
+    p.add_argument('--out', help='log file (default: logs/alert-<date>-<time>.log)')
     p.add_argument('--no-d', action='store_true', help='log D heartbeats but do not echo them')
     p.set_defaults(fn=cmd_log)
 

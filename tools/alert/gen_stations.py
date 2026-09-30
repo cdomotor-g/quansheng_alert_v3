@@ -14,6 +14,15 @@ Usage:
   python3 tools/gen_stations.py [--meganet-dir DIR] [--filter stations.filter] ...
   python3 tools/gen_stations.py --list-networks
   python3 tools/gen_stations.py --check          # CI: fail if the header is stale
+  python3 tools/gen_stations.py --blob out.bin [--filter F | --all]
+  python3 tools/gen_stations.py --check-blob out.bin [--lookup ID ...]
+
+--blob writes the station table the radio keeps in SPI flash (V2_SPEC section 8,
+uploaded with the console's STN commands) instead of the header: full names (up
+to 40 characters, not 13), no size budget but the region's 128 KB. --check-blob
+validates such a file without touching MegaNet: it re-checks every structural
+rule the firmware relies on and runs the firmware's lookup over all 8,192
+addresses.
 
 Standard library only.
 """
@@ -25,10 +34,12 @@ import io
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+import zlib
 from datetime import datetime, timezone
 
 # --------------------------------------------------------------------------------------
@@ -67,6 +78,20 @@ SITE_BYTES = 6         # sizeof(AlertSite_t)
 MAX_ALERT_ID = 0x1FFF  # 13-bit ALERT address
 NAME_MAX = 13
 NAME_ALLOWED = re.compile(r"[^A-Z0-9 /.\-&']")
+
+# The SPI-flash table (--blob), V2_SPEC section 8; App/app/alert_stn.c reads it.
+#   header  "ASTB", u16 version, u16 count, u32 names_len,
+#           u32 zlib CRC32 of everything after the header, char source[16]
+#   sites   count x {u16 base_id, u16 kinds, u32 name_off}, sorted by base_id
+#   names   NUL-terminated, name_off counted from the first
+# All little-endian.
+BLOB_MAGIC = b"ASTB"
+BLOB_VERSION = 1
+BLOB_HEADER = struct.Struct("<4sHHII16s")
+BLOB_SITE = struct.Struct("<HHI")
+BLOB_NAME_MAX = 40             # ALERT_NAME_MAX in alert_stn.h
+BLOB_MAX_BYTES = 0x20000       # 0x1C0000-0x1DFFFF
+BLOB_NAME_OK = re.compile(r"^[A-Z0-9 /.\-&']+$")
 
 # Ordered classification rules. "RN/Rep" and "Rain/Rep" must land on RAIN, so rain wins
 # over repeater; battery/volt is tested first because "Batt" never means anything else.
@@ -149,8 +174,11 @@ def suffix_kind(tokens, whole):
     return kind_of(" ".join(meaningful)) if meaningful else kind_of(whole)
 
 
-def clean_name(name):
-    """Uppercase ASCII, restricted charset, whitespace collapsed, truncated to 13."""
+def clean_name(name, limit=NAME_MAX):
+    """Uppercase ASCII, restricted charset, whitespace collapsed, truncated to `limit`.
+
+    Commas are outside the charset, so they become spaces: the radio puts names
+    into CSV fields."""
     s = strip_kind_suffix(name)
     s = s.upper()
     # fold anything non-ASCII to a space before the charset filter
@@ -163,7 +191,7 @@ def clean_name(name):
     if not words:
         words = s.split()
     s = " ".join(words)
-    s = s[:NAME_MAX].rstrip()
+    s = s[:limit].rstrip()
     return s
 
 
@@ -304,7 +332,7 @@ def networks_for_id(aid, repeater_nets):
                if any(lo <= aid <= hi for lo, hi in ranges))
 
 
-def parse_stations_json(doc, repeater_nets):
+def parse_stations_json(doc, repeater_nets, name_limit=NAME_MAX):
     """One Record per (station, alert address). Priority 0 - wins over the address file."""
     net_name = {n["id"]: n.get("name", n["id"]) for n in doc.get("radio_networks", [])}
     cat_name = {c["id"]: c.get("name", c["id"]) for c in doc.get("catchments", [])}
@@ -339,7 +367,7 @@ def parse_stations_json(doc, repeater_nets):
             cats.add(cat_name.get(cid, cid))
 
         group = "S:" + (st.get("id") or raw) + ":%d" % order
-        name = clean_name(raw)
+        name = clean_name(raw, name_limit)
         if not name:
             continue
         for aid in sorted(kinds):
@@ -355,7 +383,7 @@ def parse_stations_json(doc, repeater_nets):
 ADDR_LINE = re.compile(r"^\s*(\d+)\s+(.*\S)")
 
 
-def parse_address_file(text, repeater_nets):
+def parse_address_file(text, repeater_nets, name_limit=NAME_MAX):
     """Records from the legacy address file. Priority 1 - fallback only."""
     rows = []
     for line in text.splitlines():
@@ -374,7 +402,7 @@ def parse_address_file(text, repeater_nets):
     prev_name = None
     gidx = 0
     for order, (aid, raw) in enumerate(rows):
-        name = clean_name(raw)
+        name = clean_name(raw, name_limit)
         if not name:
             continue
         # consecutive rows sharing the cleaned name prefix belong to one site group
@@ -635,6 +663,124 @@ def render_header(sites, src, filter_path):
 
 
 # --------------------------------------------------------------------------------------
+# the SPI-flash blob (--blob / --check-blob)
+# --------------------------------------------------------------------------------------
+
+def build_blob(sites, source):
+    """The V2_SPEC section 8 blob for `sites` (build_sites output, full names)."""
+    offsets, pool_order, pool_len = build_pool(sites)
+    body = bytearray()
+    for site in sites:
+        body += BLOB_SITE.pack(site.base, site.kinds, offsets[site.name])
+    for name in pool_order:
+        body += name.encode("ascii") + b"\0"
+    assert len(body) == BLOB_SITE.size * len(sites) + pool_len
+    src = source.encode("ascii")[:15].ljust(16, b"\0")
+    head = BLOB_HEADER.pack(BLOB_MAGIC, BLOB_VERSION, len(sites), pool_len,
+                            zlib.crc32(bytes(body)) & 0xFFFFFFFF, src)
+    return head + bytes(body)
+
+
+def _blob_parts(data):
+    magic, version, count, names_len, crc, src = BLOB_HEADER.unpack_from(data, 0)
+    sites_at = BLOB_HEADER.size
+    names_at = sites_at + BLOB_SITE.size * count
+    return magic, version, count, names_len, crc, src, sites_at, names_at
+
+
+def blob_lookup(data, aid):
+    """alert_stn.c's SpiFind in Python: (name, kind) or None."""
+    _, _, count, _, _, _, sites_at, names_at = _blob_parts(data)
+    lo, hi, hit = 0, count - 1, None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        base, kinds, off = BLOB_SITE.unpack_from(data, sites_at + BLOB_SITE.size * mid)
+        if base <= aid:
+            hit = (base, kinds, off)
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if hit is None or aid - hit[0] >= SITE_SPAN:
+        return None
+    kind = (hit[1] >> (3 * (aid - hit[0]))) & 7
+    if kind == KIND_NONE:
+        return None
+    start = names_at + hit[2]
+    raw = data[start:start + BLOB_NAME_MAX + 1]
+    return raw.split(b"\0", 1)[0].decode("ascii"), kind
+
+
+def check_blob(data):
+    """Every rule the firmware relies on. Returns (problems, summary)."""
+    problems = []
+    if len(data) < BLOB_HEADER.size + BLOB_SITE.size:
+        return ["only %d bytes" % len(data)], None
+    magic, version, count, names_len, crc, src, sites_at, names_at = _blob_parts(data)
+    if magic != BLOB_MAGIC:
+        problems.append("magic %r" % magic)
+    if version != BLOB_VERSION:
+        problems.append("version %d" % version)
+    if not 0 < count < 0xFFFF:
+        problems.append("count %d" % count)
+    if len(data) > BLOB_MAX_BYTES:
+        problems.append("%d bytes, over the %d-byte region" % (len(data), BLOB_MAX_BYTES))
+    if names_at + names_len != len(data):
+        problems.append("header says %d bytes, file has %d" % (names_at + names_len, len(data)))
+    if problems:
+        return problems, None
+    if zlib.crc32(data[BLOB_HEADER.size:]) & 0xFFFFFFFF != crc:
+        problems.append("body CRC32 %08X, header says %08X"
+                        % (zlib.crc32(data[BLOB_HEADER.size:]) & 0xFFFFFFFF, crc))
+    source = src.split(b"\0", 1)[0]
+    if src[15:] != b"\0" or not re.match(rb"^[!-+\--~]+$", source or b","):
+        problems.append("source %r: printable, no spaces or commas, NUL-terminated" % src)
+
+    names = data[names_at:]
+    if names and names[-1:] != b"\0":
+        problems.append("names do not end with a NUL")
+    expected = {}
+    prev_base = -1
+    for i in range(count):
+        base, kinds, off = BLOB_SITE.unpack_from(data, sites_at + BLOB_SITE.size * i)
+        where = "site %d (base %d)" % (i, base)
+        if base <= prev_base:
+            problems.append("%s: not sorted after %d" % (where, prev_base))
+        if base > MAX_ALERT_ID:
+            problems.append("%s: base over 13 bits" % where)
+        if kinds == 0 or kinds >> 15:
+            problems.append("%s: kinds 0x%04x" % (where, kinds))
+        if off >= names_len:
+            problems.append("%s: name_off %d past the names" % (where, off))
+            continue
+        end = names.find(b"\0", off)
+        name = names[off:end].decode("ascii", "replace")
+        if not 0 < len(name) <= BLOB_NAME_MAX or not BLOB_NAME_OK.match(name):
+            problems.append("%s: name %r" % (where, name))
+        for k in range(SITE_SPAN):
+            kind = (kinds >> (3 * k)) & 7
+            if kind > KIND_CHECK:
+                problems.append("%s: kind code %d" % (where, kind))
+            if kind:
+                if base + k in expected:
+                    problems.append("%s: address %d claimed twice" % (where, base + k))
+                expected[base + k] = (name, kind)
+        prev_base = base
+    # The firmware's own search over every address, against the table read
+    # directly: it finds the greatest base <= id, so a window that reached
+    # past the next site's base would show up here as a wrong answer.
+    for aid in range(MAX_ALERT_ID + 1):
+        got = blob_lookup(data, aid)
+        if got != expected.get(aid):
+            problems.append("id %d: lookup gives %r, the table says %r" % (aid, got, expected.get(aid)))
+            if len(problems) > 40:
+                break
+    summary = ("%s: %d sites, %d addresses, %d bytes of names, %d bytes (%.1f%% of 128 KB), "
+               "crc %08X" % (source.decode("ascii", "replace"), count, len(expected), names_len,
+                             len(data), 100.0 * len(data) / BLOB_MAX_BYTES, crc))
+    return problems, summary
+
+
+# --------------------------------------------------------------------------------------
 # reporting
 # --------------------------------------------------------------------------------------
 
@@ -705,12 +851,36 @@ def main(argv=None):
                          "header, because anything in the header ends up in the "
                          "firmware image and would rewrite it on every unrelated "
                          "MegaNet push")
+    ap.add_argument("--blob", metavar="OUT",
+                    help="write the SPI-flash station table (V2_SPEC section 8) to OUT "
+                         "instead of the header: full names, up to 128 KB")
+    ap.add_argument("--all", action="store_true",
+                    help="every address MegaNet knows, instead of --filter")
+    ap.add_argument("--check-blob", metavar="FILE",
+                    help="validate a blob written by --blob and exit (no MegaNet needed)")
+    ap.add_argument("--lookup", type=int, action="append", default=[],
+                    help="with --check-blob: print what the radio would show for this id")
     args = ap.parse_args(argv)
 
+    if args.check_blob:
+        with open(args.check_blob, "rb") as fh:
+            data = fh.read()
+        problems, summary = check_blob(data)
+        for p in problems[:40]:
+            print("BAD: " + p)
+        if summary:
+            print(summary)
+        for aid in args.lookup:
+            hit = blob_lookup(data, aid) if summary else None
+            print("  %5d  %s" % (aid, "%s (%s)" % (hit[0], KIND_NAME[hit[1]]) if hit else "not in the table"))
+        print("OK" if not problems else "%d problem(s)" % len(problems))
+        return 1 if problems else 0
+
+    name_limit = BLOB_NAME_MAX if args.blob else NAME_MAX
     src = load_sources(args.meganet_dir, args.meganet_ref)
     repeater_nets = parse_repeaters(src.repeaters)
-    records = (parse_stations_json(src.stations, repeater_nets)
-               + parse_address_file(src.addresses, repeater_nets))
+    records = (parse_stations_json(src.stations, repeater_nets, name_limit)
+               + parse_address_file(src.addresses, repeater_nets, name_limit))
     universe, collisions, benign = dedupe(records)
 
     if args.list_networks:
@@ -723,7 +893,12 @@ def main(argv=None):
         print_table("Catchments:", catchment_costs(universe, src.stations))
         return 0
 
-    filt = Filter.parse(args.filter)
+    if args.all:
+        filt = Filter()
+        filt.include.append(("all", None))
+        args.filter = "all"
+    else:
+        filt = Filter.parse(args.filter)
     if filt.empty:
         raise SystemExit("%s contains no include directives - nothing to generate"
                          % args.filter)
@@ -735,6 +910,20 @@ def main(argv=None):
     bases = [s.base for s in sites]
     assert bases == sorted(bases), "sites must be sorted by base_id"
     assert len(set(bases)) == len(bases), "duplicate base_id in table"
+
+    if args.blob:
+        data = build_blob(sites, "MegaNet:" + src.short_sha[:7])
+        problems, summary = check_blob(data)
+        if problems:
+            for p in problems[:40]:
+                print("BAD: " + p)
+            raise SystemExit("the blob fails its own checks - not written")
+        with open(args.blob, "wb") as fh:
+            fh.write(data)
+        print("MegaNet %s @ %s (%s)   filter: %s" % (REPO, src.short_sha, src.date, args.filter))
+        print(summary)
+        print("Wrote %s (upload: STN BEGIN %d %08X)" % (args.blob, len(data), zlib.crc32(data) & 0xFFFFFFFF))
+        return 0
 
     text = render_header(sites, src, os.path.basename(args.filter))
     total = table_bytes(sites)
