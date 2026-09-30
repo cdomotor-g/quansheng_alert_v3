@@ -45,6 +45,11 @@
 #include "settings.h"
 #include "version.h"
 
+#include "app/dfu.h"
+#ifdef ENABLE_ALERT
+    #include "app/alert.h"
+#endif
+
 #if defined(ENABLE_OVERLAY)
     #include "sram-overlay.h"
 #endif
@@ -851,6 +856,37 @@ void UART_HandleCommand(uint32_t Port)
                 NVIC_SystemReset();
             #endif
             break;
+
+        // Hands-off DFU (App/app/dfu.c). 0x05E1 reports the on-device bootloader
+        // guard; 0x05E0 (payload = magic DFU_HOST_MAGIC) arms the trampoline and
+        // resets, but only when the guard passes. Both reply with a K line.
+        case 0x05E1: // DFU_CHECK
+            DFU_HostCheck();
+            break;
+
+        case 0x05E0: // ENTER_DFU
+            DFU_HostEnter(pUART_Command->Buffer + sizeof(Header_t),
+                          pUART_Command->Header.Size);
+            break;
+
+#ifdef ENABLE_ALERT
+        // ALERT sweep host control (plan section 8). B defines the byte layouts;
+        // D just forwards the command body (after the 4-byte header) and acks.
+        case 0x0A01: // ARR_SET
+            DFU_EmitAck("a01", ALERT_HostArrSet(pUART_Command->Buffer + sizeof(Header_t),
+                                                pUART_Command->Header.Size));
+            break;
+
+        case 0x0A02: // SWEEP_CTL
+            DFU_EmitAck("a02", ALERT_HostSweepCtl(pUART_Command->Buffer + sizeof(Header_t),
+                                                  pUART_Command->Header.Size));
+            break;
+
+        case 0x0A03: // POKE_LIST
+            DFU_EmitAck("a03", ALERT_HostPokeList(pUART_Command->Buffer + sizeof(Header_t),
+                                                  pUART_Command->Header.Size));
+            break;
+#endif
 
 #ifdef ENABLE_UART_RW_BK_REGS
         case 0x0601:

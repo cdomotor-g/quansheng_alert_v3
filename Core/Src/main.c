@@ -30,6 +30,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "app/dfu.h"
 
 /* Private define ------------------------------------------------------------*/
 /* Private variables ---------------------------------------------------------*/
@@ -45,6 +46,14 @@ static void APP_SystemClockConfig(void);
   */
 int main(void)
 {
+  /* Hands-off DFU trampoline. Must be the very first thing main() does: if a DFU
+   * entry was requested and the on-device bootloader guard passes, this hands
+   * control to the stock bootloader's DFU and never returns. On a normal boot it
+   * is a single no-init read and falls straight through. Then classify this reset
+   * (power-on / software / watchdog / fault) before any peripheral is touched. */
+  DFU_Trampoline();
+  DFU_BootInit();
+
   /* Enable SYSCFG and PWR clock */
   LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_SYSCFG);
   LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);

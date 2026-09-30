@@ -31,6 +31,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "py32f071_it.h"
+#include "app/dfu.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* Private typedef -----------------------------------------------------------*/
@@ -56,6 +57,11 @@ void NMI_Handler(void)
   */
 void HardFault_Handler(void)
 {
+  /* Record "fault" in the no-init cell, bump the abnormal-reset counter and
+   * reset, so a fault self-recovers (and, if it keeps recurring, eventually
+   * heals into DFU) instead of spinning here forever. */
+  DFU_RecordFaultAndReset();
+
   while (1)
   {
   }

@@ -46,6 +46,7 @@
 #ifdef ENABLE_ALERT
 #include "app/alert.h"
 #endif
+#include "app/dfu.h"
 #if defined(ENABLE_UART) || defined(ENABLE_USB)
     #include "app/uart.h"
     #include "scheduler.h"
@@ -1609,9 +1610,50 @@ void CheckKeys(void)
     }
 }
 
+#ifdef ENABLE_ALERT
+// ALERT-X1 boot policy (plan sections 2 and 7). Runs from the 10 ms slice while
+// the radio is still in normal mode. It prints the boot 'B' line once, holds a
+// 5 s window in which USB commands (including DFU) are serviced, then decides:
+//   - >= 5 abnormal resets: heal into DFU by itself (guard-checked);
+//   - >= 3 abnormal resets: stay in normal mode so a host can intervene;
+//   - otherwise: autostart the ALERT sweep.
+// The 60 s "healthy" clear of the abnormal-reset counter is done in SysTick.
+static void AlertBootTask(void)
+{
+    static uint16_t ticks;      // 10 ms ticks since boot
+    static bool     announced;  // boot line sent
+    static bool     decided;    // autostart decision made (runs once)
+
+    if (decided)
+        return;
+
+    if (!announced) {
+        DFU_EmitBootLine();
+        announced = true;
+    }
+
+    if (++ticks < 500)          // 5 s
+        return;
+
+    decided = true;
+
+    if (DFU_AutoDfuDue()) {
+        DFU_RequestDfu();       // resets here if the bootloader guard passes
+        return;
+    }
+
+    if (!DFU_AutostartBlocked())
+        gRequestAlertApp = true;   // serviced by CheckKeys() -> APP_RunAlert()
+}
+#endif
+
 void APP_TimeSlice10ms(void)
 {
     gNextTimeslice = false;
+
+#ifdef ENABLE_ALERT
+    AlertBootTask();
+#endif
 
     SETTINGS_SaveVfoIndicesFlush();
 

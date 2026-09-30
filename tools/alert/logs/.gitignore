@@ -1,0 +1,2 @@
+# radio.py writes the X1 USB stream here; logs stay on the bench machine
+*.log

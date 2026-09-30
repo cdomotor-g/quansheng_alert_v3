@@ -29,6 +29,8 @@
 #include "driver/backlight.h"
 #include "driver/gpio.h"
 
+#include "app/dfu.h"
+
 #define DECREMENT(cnt) \
     do {               \
         if (cnt > 0)   \
@@ -48,7 +50,12 @@ static volatile uint32_t gGlobalSysTickCounter;
 void SysTick_Handler(void)
 {
     gGlobalSysTickCounter++;
-    
+
+    // Soft watchdog for the (blocking) ALERT loop and the 60 s "healthy" timer
+    // that forgets the abnormal-reset history. Armed only inside APP_RunAlert;
+    // free-running uptime otherwise. See App/app/dfu.c.
+    DFU_WatchdogTick();
+
     gNextTimeslice = true;
 
     if ((gGlobalSysTickCounter % 50) == 0) {

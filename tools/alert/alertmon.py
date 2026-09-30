@@ -20,15 +20,22 @@ Every A line is re-decoded here with a Python port of App/app/alert_decode.c.
 If the firmware missed a frame the bits do contain, this says so - which
 separates "the decoder is wrong" from "the bits are not there".
 
+The ALERT-X1 build adds B L C H X Y F P PT AUD Z G K lines (X1_PLAN.md s8).
+They are shown as they arrive, with X decodes flagged and H hex abbreviated;
+judging them is sweep_judge.py's job, and logging them is radio.py's.
+
     python tools/alert/alertmon.py COM5 [seconds]
 
-Passive: sends nothing to the radio.
+Passive: sends nothing to the radio, apart from re-asserting DTR after 10 s of
+silence. A USB send that times out clears the firmware's DTR flag, and nothing
+more arrives until the host asserts DTR again (App/usb/usbd_cdc_if.c).
 """
 import sys
 import time
 from datetime import datetime
 
-import serial
+# pyserial is imported in main(): the decoder port below is imported by
+# capture_stats.py and sweep_judge.py, which only read logs
 
 # --------------------------------------------------------------------------
 # port of App/app/alert_decode.c
@@ -85,23 +92,35 @@ def decode_payload32(payload):
     return None
 
 
-def scan_polarity(buf, nbits, polarity, max_gap=20, max_out=8):
+def scan_polarity(buf, nbits, polarity, max_gap=20, max_out=8, min_idle=0):
+    """UART emulation over one-sample-per-bit data.
+
+    min_idle > 0 is the preamble gate of ALERT_ScanSamples, for decimated
+    oversampled captures: a frame is believed only if min_idle idle bits come
+    before its first start bit, or it begins within 20 bits of the previous
+    accepted frame's end. ABF and EIF each constrain only ~8 bits, so without
+    the gate noise decodes all the time. It is the gate of
+    scan_samples.scan_bits_gated; 0 leaves this scanner as it always was."""
     idle = 0 if polarity == POL_NEGATIVE else 1
     start = idle ^ 1
+    # unpack once: the judge's chance control runs this hundreds of times per
+    # capture, and a getbit() call per access dominated the run time
+    bits = [getbit(buf, i) for i in range(nbits)]
     words, word_pos, out = [], [], []
+    last_stop = -1
     pos = 0
     while pos + 10 <= nbits and len(out) < max_out:
-        if getbit(buf, pos) != start:
+        if bits[pos] != start:
             pos += 1
             continue
-        if pos > 0 and getbit(buf, pos - 1) != idle:
+        if pos > 0 and bits[pos - 1] != idle:
             pos += 1
             continue
-        if getbit(buf, pos + 9) != idle:
+        if bits[pos + 9] != idle:
             pos += 1
             words, word_pos = [], []
             continue
-        w = sum(getbit(buf, pos + 1 + i) << i for i in range(8))
+        w = sum(bits[pos + 1 + i] << i for i in range(8))
         if words and (pos - (word_pos[-1] + 10)) > max_gap:
             words, word_pos = [], []
         if len(words) == 4:
@@ -110,14 +129,19 @@ def scan_polarity(buf, nbits, polarity, max_gap=20, max_out=8):
         word_pos.append(pos)
         pos += 10
         if len(words) == 4:
+            p0 = word_pos[0]
+            if min_idle > 0 and not (last_stop >= 0 and p0 <= last_stop + 20):
+                if p0 < min_idle or start in bits[p0 - min_idle:p0]:
+                    continue
             payload = 0
             for k in range(4):
                 for i in range(8):
                     payload |= ((words[k] >> i) & 1) << (31 - (8 * k + i))
             r = decode_payload32(payload)
             if r:
-                out.append((r, word_pos[0], polarity))
+                out.append((r, p0, polarity))
                 words, word_pos = [], []
+                last_stop = pos
     return out
 
 
@@ -169,13 +193,25 @@ def handle(txt):
                           (fmt, a, d, pos, 'NEG' if pol == POL_NEGATIVE else 'STD'))
             else:
                 print('             no framed word run decodes in either polarity')
-    elif txt.startswith('D '):
-        print('[%s] %s' % (stamp, txt))
+    elif txt.startswith('H '):
+        # a window is several of these; the hex is for the judge, not a person
+        parts = txt.split()
+        if len(parts) >= 5:
+            print('[%s] H arr %s burst %s @%s: %d bytes' %
+                  (stamp, parts[1], parts[2], parts[3], len(parts[4]) // 2))
+        else:
+            print('[%s] %s' % (stamp, txt))
+    elif txt.startswith('X ') or txt.startswith('G '):
+        print('[%s] >>> %s' % (stamp, txt))
     else:
+        # D, the other X1 lines (B L C Y F P PT AUD Z K) and anything
+        # unforeseen: shown verbatim, never an error
         print('[%s] %s' % (stamp, txt))
 
 
 def main():
+    import serial
+
     port = sys.argv[1] if len(sys.argv) > 1 else 'COM5'
     secs = int(sys.argv[2]) if len(sys.argv) > 2 else 180
 
@@ -188,6 +224,7 @@ def main():
     pending = b''
     total = 0
     last_beat = 0.0
+    last_rx = t0
     while time.time() - t0 < secs:
         n = ser.in_waiting
         if n:
@@ -200,11 +237,19 @@ def main():
                     handle(txt)
                     sys.stdout.flush()
             last_beat = time.time() - t0
+            last_rx = time.time()
         else:
             el = time.time() - t0
             if el - last_beat >= 15:
                 last_beat = el
                 print('  ... %.0fs, %d bytes' % (el, total), flush=True)
+            if time.time() - last_rx >= 10:
+                # a timed-out send cleared dtr_enable in the firmware; only a
+                # fresh SET_CONTROL_LINE_STATE brings the stream back
+                ser.dtr = False
+                time.sleep(0.05)
+                ser.dtr = True
+                last_rx = time.time()
             time.sleep(0.02)
     print('done: %d bytes in %ds' % (total, secs), flush=True)
     ser.close()

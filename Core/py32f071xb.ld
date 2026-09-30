@@ -59,9 +59,18 @@ _Min_Heap_Size = 0x200;      /* required amount of heap  */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
 /* Specify the memory areas */
+/* The top 32 bytes of RAM are carved off into a NOLOAD region for the DFU
+ * no-init cell (App/app/dfu.c). It must survive a warm reset and the
+ * app<->bootloader hand-off, so it sits above _estack where neither the app's
+ * startup code (which only clears _sbss.._ebss) nor the stock bootloader (which
+ * zero-fills 0x200001A0..0x2000257F under its 0x20002580 stack top) ever writes.
+ * 32 (not 16) bytes so the cell can also hold a validity signature, which lets
+ * a power-on be told from a warm reset without trusting the RCC reset flags the
+ * bootloader may have cleared. */
 MEMORY
 {
-RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 16K
+RAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 16K - 32
+NOINIT (rw)    : ORIGIN = 0x20003FE0, LENGTH = 32
 FLASH (rx)      : ORIGIN = 0x08002800, LENGTH = 118K
 }
 
@@ -170,6 +179,17 @@ SECTIONS
     _ebss = .;         /* define a global symbol at bss end */
     __bss_end__ = _ebss;
   } >RAM
+
+  /* DFU no-init cell (App/app/dfu.c). NOLOAD, in its own region above _estack,
+   * so the startup code neither zero-fills nor flash-loads it and its contents
+   * carry across a warm reset. */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    KEEP(*(.noinit))
+    KEEP(*(.noinit*))
+    . = ALIGN(4);
+  } >NOINIT
 
   /* User_heap_stack section, used to check that there is enough RAM left */
   ._user_heap_stack :

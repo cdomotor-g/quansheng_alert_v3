@@ -321,6 +321,10 @@ python tools/alert/wavdecode.py burst.wav
 | `wavdecode.py` | measures tones and rate from a recording, then decodes. |
 | `make_test_wav.py` | synthesises a burst with a known answer, at the real tones. |
 | `alertmon.py` | reads the live serial stream. |
+| `radio.py` | ALERT-X1: logs the USB-C stream with PC timestamps and sends the X1 host commands. |
+| `sweep_judge.py` | ALERT-X1: gives a verdict on every arrangement from one or more logs, with the plan's exit codes. |
+| `scan_samples.py` | Python port of `ALERT_ScanSamples`, the oversampled edge slicer; the judge decodes with it. |
+| `test_judge.py` | fabricates X1 logs whose answer is known and checks the judge's verdicts and radio.py's framing. |
 
 ```bash
 gcc -std=c11 -Wall -Wextra -Werror -I App \
@@ -348,3 +352,60 @@ an EEPROM poke would be overwritten. Use the menu.
 D I<irq> S<syncs> F<frames> G<gated> X<stuck> B<bits> R<rssi> Q<squelch>
   N<bursts> m<mode> y<sync> v<invert> l<sync4> f<floor> p<peak> V<inverted-sense>
 ```
+
+## ALERT-X1: running the sweep and judging it
+
+The plan is `X1_PLAN.md`. After the one PTT-held flash, the build needs no
+keypresses. The ALERT app starts 5 s after boot, runs the audio-pin census, and
+paces the sweep to real bursts. A Phase 1 pass takes about 8 minutes; coverage
+good enough for a "dead" verdict takes 1-2 hours of traffic.
+
+```bash
+python tools/alert/radio.py log                  # Ctrl-C to stop; or --minutes 120
+python tools/alert/sweep_judge.py tools/alert/logs/x1-*.log
+```
+
+`radio.py log` finds the port by VID 36B7 and asserts DTR. It re-asserts DTR
+after 10 s of silence, because a timed-out USB send in the firmware clears the
+DTR flag and nothing more arrives until the host sets it again. It writes every
+line with a PC timestamp to `tools/alert/logs/`, which git ignores. It survives
+resets, and it releases the port for 90 s when it sees bootloader beacons so
+that `hotflash.py` can take it.
+
+While the logger runs, the other subcommands pass their frame to it over
+localhost, because Windows lets only one process open a COM port:
+
+```bash
+python tools/alert/radio.py sweep-ctl goto 19    # stop|start|goto|adopt|clear|dwell|census|enter|reboot
+python tools/alert/radio.py bk-read 0x58 0x59 0x5C
+python tools/alert/radio.py poke 0x59:0xFFF0:0x0006
+python tools/alert/radio.py reboot --wait        # prints the B line
+```
+
+The judge prints one row per arrangement: BITS, SYNC, STRUCT with the in-byte
+bit order that passed, DECODE, REPEAT, the chance control and the noise-sync
+ratio. It then gives an overall verdict:
+
+| Exit | Verdict | Next |
+|---|---|---|
+| 0 | WORKS, LIKELY, or ADC route works | The firmware adopts at REPEAT 3 by itself (`G ADOPT`). For LIKELY, keep logging. |
+| 1 | BITS-NO-DECODE | The bits are there. Check the bit order, rate or decoder with `capture_stats.py [--lsb] --arr <idx> <log>`. |
+| 2 | FSK route dead | See the plan's section 11: one capacitor to PA4, or the earphone lead and `wavdecode.py`. |
+| 3 | Not enough data | Keep logging. The "still needed" lines say which arrangements are short. |
+
+The judge decodes the `H` windows on the host with the `scan_samples.py` edge
+slicer. For integer k it also uses phase decimation, and it falls back to
+decimation alone if `scan_samples.py` is missing. Every path uses the
+firmware's 12-idle-bit gate, and the chance control shuffles each window's run
+lengths through the same procedure. A decode counts only when it names a table
+station, so a real result repeats: the same ID, on the same path, across
+separate bursts.
+
+STRUCT is measured from the preamble run through one frame, not over the whole
+window. The window carries up to 140 ms of discriminator noise on either side
+of the burst, which would sink a perfect capture. `python tools/alert/test_judge.py`
+checks all of this on fabricated logs.
+
+The `ARR_SET`, `SWEEP_CTL` and `POKE_LIST` payload layouts are defined in
+`radio.py` and must match the comment on `ALERT_Host*` in `alert.c`. A `K ... ok=0`
+reply means they do not. `radio.py send <id> <hex>` sends any body as-is.

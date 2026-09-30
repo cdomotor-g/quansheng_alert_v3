@@ -25,11 +25,14 @@ _QUIT = "quit"
 
 class Programmer:
 
-    def __init__(self, ser: Serial, fw_image: bytes, bl_ver: str):
+    def __init__(self, ser: Serial, fw_image: bytes, bl_ver: str, resume: bool = False):
         self._ser = ser
         self._fw_image = fw_image
         self.bl_ver = bl_ver
-        self._state = _Init(self)
+        # Recovery: a bootloader left mid-flash sits in state 2 and no longer
+        # beacons, so _Init would wait forever. Resending from page 0 restarts
+        # the programming without a beacon wait or a fresh handshake.
+        self._state = _ProgFw(self) if resume else _Init(self)
         # self._state = _Logging(self)
 
     def loop(self) -> bool:

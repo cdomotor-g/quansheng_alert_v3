@@ -113,6 +113,7 @@ def main_flash(args, ser):
 
     bl_ver: str = args.bl_ver
     fw_file: str = args.file
+    resume: bool = getattr(args, "resume", False)
 
     try:
         fw_image = load_image(fw_file)
@@ -137,7 +138,7 @@ def main_flash(args, ser):
 
     signal.signal(signal.SIGINT, quit_handler)
 
-    prog = pp.Programmer(ser, fw_image, bl_ver)
+    prog = pp.Programmer(ser, fw_image, bl_ver, resume=resume)
 
     while (not quit_flag) and prog.loop():
         sleep(0)
@@ -215,9 +216,19 @@ def main():
     )
     ap_flash.add_argument(
         "--bl-ver",
-        help="bootloader version, eg. '1.01'. Max 4 characters. Default '?'",
+        # The V3 stock bootloader (7.00.07) accepts only "7.00" or "*" as the
+        # 0x0530 handshake token; the previous default "?" was rejected and the
+        # flash would hang at the handshake. Default to "7.00"; pass "*" to skip
+        # the check on other radios.
+        help="bootloader version handshake token, max 4 chars. Default '7.00' (use '*' to match any)",
         required=False,
-        default="?",
+        default="7.00",
+    )
+    ap_flash.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip the beacon wait and handshake, resending from page 0 "
+        "(recovery for a bootloader left mid-flash in state 2, which no longer beacons)",
     )
     ap_flash.add_argument("file", help="firmware image file")
 
