@@ -507,9 +507,10 @@ static void CensusEvt(const char *state)
 static uint32_t openMs, lostMs, lostUp;
 static bool     draining;        // squelch shut, the burst not finished for DRAIN_MS
 static bool     burstTainted;    // the receiver was re-armed under it
-// The loop was just blocked - an arm (~30 ms), the census (~3 s), a flash
-// write. A squelch edge first seen right after one may be long past: the
-// opening was never sampled, so that burst is tainted rather than decoded.
+// The loop was just blocked - an arm (~30 ms), the census (~3 s), a settings
+// save, or a stall past STALL_TICKS. A squelch edge first seen right after one
+// may be long past: the opening was never sampled, so that burst is tainted
+// rather than decoded.
 static bool     blocked;
 
 // DRAIN_MS was the FSK FIFO's: no word left stranded when the carrier drops.
@@ -522,6 +523,19 @@ static bool     blocked;
 // samples for exactly that (PA8_SETTLE_SAMPLES); here the sampling starts that
 // much later instead. nowMs moves in 10 ms steps, so 30 is 20-30 ms real.
 #define SPK_SETTLE_MS  30u
+// A stall a burst absorbs. Its sampling starts SPK_SETTLE_MS after the edge
+// anyway, the decoder needs 12 idle bits (40 ms) ahead of a frame and no
+// more, and the check bits reject whatever is not a frame. A console line or
+// a log record is a few ms, a sector erase usually tens: tainting the next
+// burst after each of those threw away bursts that decode. Past ~100 ms the
+// opening, and the burst_ms, are anyone's guess.
+#define STALL_TICKS    10u       // 10 ms ticks: more than this taints
+
+static void Stalled(uint32_t t0)
+{
+	if (SCHEDULER_Ticks10ms() - t0 > STALL_TICKS)
+		blocked = true;
+}
 
 // Plain receive with the AF at FM: the ADC route takes the demodulated audio
 // from PA4, and nothing else is needed from the chip. This is what the FSK
@@ -567,7 +581,13 @@ static void Persist(void)
 void ALERT_SettingsChanged(void)
 {
 	StoreConfig();
-	persistReq = true;
+	// A flash write: in the app, at the next quiet moment. Outside it (the
+	// console from app.c's slice) at once - nothing else there would save it,
+	// and a setting lost at the next power-off was never really set.
+	if (running)
+		persistReq = true;
+	else
+		SETTINGS_SaveSettings();
 }
 
 // ---------------------------------------------------------------------------
@@ -646,20 +666,19 @@ static void Record(const AlertRecord_t *rec)
 	uint32_t seq = 0;
 
 	bootSeq++;
-	if (gAlertCfg.log && (seq = ALERTLOG_NextSeq()) != 0) {
+	if (gAlertCfg.log) {
+		// A page write is ~1 ms, but crossing into a new sector erases it
+		// first, and LOG turned on since entry makes this boot's claim on the
+		// log here (ALERTLOG_Use): either can outlast what a burst absorbs.
 		const uint32_t t0 = SCHEDULER_Ticks10ms();
-		if (!ALERTLOG_Append(rec)) {
+		if (ALERTLOG_Use() && (seq = ALERTLOG_NextSeq()) != 0 && !ALERTLOG_Append(rec)) {
 			seq = 0;
 			if (!logErr) {
 				logErr = true;
 				EmitEvt("LOG", "APPEND FAIL");
 			}
 		}
-		// A page write is ~1 ms, but crossing into a new sector erases it
-		// first, tens of ms: a squelch edge first seen after that may be long
-		// past, exactly as after a settings save (see `blocked`).
-		if (SCHEDULER_Ticks10ms() - t0 > 1u)
-			blocked = true;
+		Stalled(t0);
 	}
 	if (gAlertCfg.csv) {
 		ALERT_FormatRecord(lb, "DEC", seq ? seq : bootSeq, rec);
@@ -871,6 +890,10 @@ static void BurstFinish(void)
 
 static void BurstOpen(void)
 {
+	// The header's RX (V2_SPEC 3), first: a status-line blit is ~1.4 ms, and
+	// the sampling below has not started yet. The full redraw that clears it
+	// waits for the squelch to shut, which no ALERT burst outlasts.
+	ALERTUI_MarkRx();
 	openMs       = nowMs;
 	burstPeak    = rssiDbm;
 	burstTainted = false;
@@ -1094,21 +1117,45 @@ const char *ALERT_SetName(uint8_t row)
 // Values are at most eight characters (see the settings view), and a
 // two-state row reads exactly OFF/ON or its own two words, so the console can
 // match a SET against them.
+static const char *const onOff[2]    = { "OFF", "ON" };
+static const char *const spkNames[3] = { "OFF", "SQL", "ON" };   // ALERT_SPK_*
+
+// The two-valued rows: where each keeps its value. NULL for the others.
+static bool *Flag(uint8_t row)
+{
+	switch (row) {
+		case SET_VOICE:   return &gAlertCfg.voice;
+		case SET_CSV:     return &gAlertCfg.csv;
+		case SET_LOG:     return &gAlertCfg.log;
+		case SET_UNKNOWN: return &gAlertCfg.show_unknown;
+		case SET_CONFIRM: return &gAlertCfg.confirm;
+		case SET_GATE:    return &gAlertCfg.gate;
+		case SET_DEBUG:   return &gAlertCfg.debug;
+		default:          return NULL;
+	}
+}
+
+static const char *Word(uint8_t row, bool on)
+{
+	if (row == SET_UNKNOWN)
+		return on ? "SHOW" : "HIDE";
+	if (row == SET_CONFIRM)
+		return on ? "2 COPIES" : "OFF";
+	return onOff[on];
+}
+
 void ALERT_SetValue(uint8_t row, char *s)
 {
-	static const char *const onoff[2] = { "OFF", "ON" };
-	static const char *const spk[3]   = { "OFF", "SQL", "ON" };
+	const bool *f;
+
 	CfgReady();
+	if ((f = Flag(row)) != NULL) {
+		strcpy(s, Word(row, *f));
+		return;
+	}
 	switch (row) {
-		case SET_VOICE:    strcpy(s, onoff[gAlertCfg.voice]); break;
-		case SET_SPEAKER:  strcpy(s, spk[gAlertCfg.speaker % 3u]); break;
-		case SET_CSV:      strcpy(s, onoff[gAlertCfg.csv]); break;
-		case SET_LOG:      strcpy(s, onoff[gAlertCfg.log]); break;
-		case SET_UNKNOWN:  strcpy(s, gAlertCfg.show_unknown ? "SHOW" : "HIDE"); break;
-		case SET_CONFIRM:  strcpy(s, gAlertCfg.confirm ? "2 COPIES" : "OFF"); break;
-		case SET_GATE:     strcpy(s, onoff[gAlertCfg.gate]); break;
+		case SET_SPEAKER:  strcpy(s, spkNames[gAlertCfg.speaker % 3u]); break;
 		case SET_SNR:      sprintf(s, "%u", gAlertCfg.snr_req); break;
-		case SET_DEBUG:    strcpy(s, onoff[gAlertCfg.debug]); break;
 		case SET_MODE:     strcpy(s, "ADC"); break;    // the only demodulator left
 		case SET_CENSUS:
 			if (ALERT_CensusPending())           strcpy(s, "PENDING");
@@ -1138,6 +1185,18 @@ static void SetEvt(uint8_t row)
 	EmitEvt("SET", d);
 }
 
+// A row has changed: the screen, and its EVT SET. In the app the EVT waits
+// for a quiet moment (and a held key's steps coalesce into one line with the
+// final value); outside it there is no burst to protect.
+static void Changed(uint8_t row)
+{
+	redraw = true;
+	if (running)
+		setDirty |= (uint16_t)(1u << row);
+	else
+		SetEvt(row);
+}
+
 static void ApplySquelch(void)
 {
 	RADIO_ConfigureSquelchAndOutputPower(gRxVfo);
@@ -1149,14 +1208,29 @@ static void ApplySquelch(void)
 	RxArm();
 }
 
-static void StepSquelch(int dir)
+// SQL LEVEL in tenths, 0.0-9.0
+static void SetSquelch(int lvl)
 {
-	int lvl = gEeprom.SQUELCH_LEVEL * 10 + gEeprom.SQUELCH_TENTHS + dir;
 	if (lvl < 0) lvl = 0;
 	if (lvl > 90) lvl = 90;
 	gEeprom.SQUELCH_LEVEL  = (uint8_t)(lvl / 10);
 	gEeprom.SQUELCH_TENTHS = (uint8_t)(lvl % 10);
 	ApplySquelch();
+}
+
+// FREQ, in units of 10 Hz, inside the 2 m / VHF range the receiver can
+// actually tune. Saved with the VFO so it survives leaving the app; another
+// channel has another floor.
+#define FREQ_MIN 13000000        // 130 MHz
+#define FREQ_MAX 17400000        // 174 MHz
+
+static void Tune(int32_t f)
+{
+	gRxVfo->pRX->Frequency = (uint32_t)(f < FREQ_MIN ? FREQ_MIN : (f > FREQ_MAX ? FREQ_MAX : f));
+	gRequestSaveVFO = true;
+	RADIO_SetupRegisters(true);
+	RxArm();
+	NfReseed();
 }
 
 // Outside the app - the console also runs from app.c's slice, in normal radio
@@ -1167,24 +1241,26 @@ static void StepSquelch(int dir)
 // act on the receiver refuse.
 bool ALERT_SetStep(uint8_t row, int dir)
 {
+	bool *f;
+
 	CfgReady();
+	if ((f = Flag(row)) != NULL) {
+		*f = !*f;
+		if (row == SET_CSV)
+			csvLines = 200;              // a host that just switched it on gets the HDR block first
+		Changed(row);
+		return true;
+	}
 	switch (row) {
-		case SET_VOICE:    gAlertCfg.voice = !gAlertCfg.voice; break;
 		case SET_SPEAKER:
 			// OFF -> SQL -> ON going up. Only the audio path moves: the AF
-			// stays at FM for the ADC.
+			// stays at FM for the ADC. Not under a burst being sampled, where
+			// the amplifier's switching step would land in the samples:
+			// BurstFinish applies SPEAKER once the burst is over.
 			gAlertCfg.speaker = (uint8_t)((gAlertCfg.speaker + 3 + dir) % 3);
-			if (running)
+			if (running && !adcRunning && !adcDelayed)
 				AudioPath();
 			break;
-		case SET_CSV:
-			gAlertCfg.csv = !gAlertCfg.csv;
-			csvLines = 200;              // a host that just switched it on gets the HDR block first
-			break;
-		case SET_LOG:      gAlertCfg.log = !gAlertCfg.log; break;
-		case SET_UNKNOWN:  gAlertCfg.show_unknown = !gAlertCfg.show_unknown; break;
-		case SET_CONFIRM:  gAlertCfg.confirm = !gAlertCfg.confirm; break;
-		case SET_GATE:     gAlertCfg.gate = !gAlertCfg.gate; break;
 		case SET_SNR: {
 			const int v = (int)gAlertCfg.snr_req + dir;
 			if (v < (int)ALERT_SNR_MIN || v > (int)ALERT_SNR_MAX)
@@ -1192,45 +1268,139 @@ bool ALERT_SetStep(uint8_t row, int dir)
 			gAlertCfg.snr_req = (uint8_t)v;
 			break;
 		}
-		case SET_DEBUG:    gAlertCfg.debug = !gAlertCfg.debug; break;
 		case SET_CENSUS:
 			// UP re-runs it (V2_SPEC 5); DOWN does nothing
 			if (!running || dir <= 0)
 				return false;
 			censusReq = true;
 			break;
-		case SET_FREQ: {
+		case SET_FREQ:
+			// 12.5 kHz, the ALERT channel spacing
 			if (!running)
 				return false;
-			// Frequency is in units of 10 Hz. Step 12.5 kHz, the ALERT channel
-			// spacing, and keep it inside the 2 m / VHF range the receiver can
-			// actually tune.
-			int32_t f = (int32_t)gRxVfo->pRX->Frequency + dir * 1250;
-			if (f < 13000000) f = 13000000;      // 130 MHz
-			if (f > 17400000) f = 17400000;      // 174 MHz
-			gRxVfo->pRX->Frequency = (uint32_t)f;
-			gRequestSaveVFO = true;              // so it survives leaving the app
-			RADIO_SetupRegisters(true);
-			RxArm();
-			NfReseed();                          // another channel, another floor
+			Tune((int32_t)gRxVfo->pRX->Frequency + dir * 1250);
 			break;
-		}
 		case SET_SQL:
 			if (!running)
 				return false;
-			StepSquelch(dir);
+			SetSquelch(gEeprom.SQUELCH_LEVEL * 10 + gEeprom.SQUELCH_TENTHS + dir);
 			break;
 		default: return false;                   // SET_MODE is read-only
 	}
-	redraw = true;
-	// In the app the EVT waits for a quiet moment (and a held key's steps
-	// coalesce into one line with the final value); outside it there is no
-	// burst to protect.
-	if (running)
-		setDirty |= (uint16_t)(1u << row);
-	else
-		SetEvt(row);
+	Changed(row);
 	return true;
+}
+
+// A console value against a row's word: '_' is a space, either case.
+static bool ValIs(const char *want, const char *v)
+{
+	for (;; want++, v++) {
+		char c = *v;
+		if (c == '_')
+			c = ' ';
+		else if (c >= 'a' && c <= 'z')
+			c = (char)(c - 32);
+		if (c != *want)
+			return false;
+		if (!c)
+			return true;
+	}
+}
+
+// A settings number, all of it: digits with at most one '.' and at most dec
+// digits after it, as an integer in units of 10^-dec ("162.55" with dec 5 is
+// 16255000). Anything else - a sign, a comma, a trailing letter - is false.
+// Saturates far past every row's range rather than overflowing.
+static bool Fixed(const char *s, uint8_t dec, int32_t *v)
+{
+	int32_t x = 0;
+	int8_t  frac = -1;               // digits after the '.'; -1 before one
+	bool    digit = false;
+
+	for (; *s; s++) {
+		if (*s == '.' && frac < 0) {
+			frac = 0;
+			continue;
+		}
+		if (*s < '0' || *s > '9' || (frac >= 0 && ++frac > (int8_t)dec))
+			return false;
+		digit = true;
+		x = x < 100000000 ? x * 10 + (*s - '0') : 999999999;
+	}
+	for (frac = frac < 0 ? 0 : frac; frac < (int8_t)dec; frac++)
+		x = x < 100000000 ? x * 10 : 999999999;
+	*v = x;
+	return digit;
+}
+
+// The console's SET used to walk ALERT_SetStep towards the value: a retune
+// (30 ms in BK4819_ResetFSK) per 12.5 kHz of FREQ, the side effects of every
+// value passed on the way, and all of it undone after a refusal. This goes
+// straight to the value, or nowhere.
+const char *ALERT_SetTo(uint8_t row, const char *v)
+{
+	char        cur[12];
+	int32_t     x = 0;
+	const bool *f;
+
+	ALERT_SetValue(row, cur);            // CfgReady too
+	if (ValIs(cur, v))
+		return NULL;                     // already so: nothing to change or say
+	if ((f = Flag(row)) != NULL) {
+		if (!ValIs(Word(row, !*f), v))
+			return "ARGS";
+		ALERT_SetStep(row, +1);
+	} else switch (row) {
+		case SET_SPEAKER:
+			while (x < 3 && !ValIs(spkNames[x], v))
+				x++;
+			if (x == 3)
+				return "ARGS";
+			// of three values, whichever it is is one step away, up or down
+			ALERT_SetStep(row, x == (gAlertCfg.speaker + 1) % 3 ? +1 : -1);
+			break;
+		case SET_SNR:
+			if (!Fixed(v, 0, &x))
+				return "ARGS";
+			if (x < (int32_t)ALERT_SNR_MIN || x > (int32_t)ALERT_SNR_MAX)
+				return "RANGE";
+			if (x == gAlertCfg.snr_req)
+				return NULL;
+			gAlertCfg.snr_req = (uint8_t)x;
+			Changed(row);
+			break;
+		case SET_FREQ:
+			if (!Fixed(v, 5, &x))
+				return "ARGS";
+			x = (x + 625) / 1250 * 1250;         // the nearest 12.5 kHz channel
+			if (x < FREQ_MIN || x > FREQ_MAX)
+				return "RANGE";
+			if (!running)
+				return "NOTINAPP";
+			if ((uint32_t)x == gRxVfo->pRX->Frequency)
+				return NULL;
+			Tune(x);
+			Changed(row);
+			break;
+		case SET_SQL:
+			if (!Fixed(v, 1, &x))
+				return "ARGS";
+			if (x > 90)
+				return "RANGE";
+			if (!running)
+				return "NOTINAPP";
+			if (x == gEeprom.SQUELCH_LEVEL * 10 + gEeprom.SQUELCH_TENTHS)
+				return NULL;
+			SetSquelch(x);
+			Changed(row);
+			break;
+		case SET_MODE:
+			return "READONLY";
+		default:
+			return "ARGS";                       // CENSUS: only "+" re-runs it
+	}
+	ALERT_SettingsChanged();
+	return NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,7 +1571,8 @@ void APP_RunAlert(void)
 	staMs = 0; setDirty = 0; logErr = false;
 	ALERTUI_Reset();
 	ALERTSTN_Init();
-	(void)ALERTLOG_Init();
+	// LOG OFF writes nothing to the log region, not even the boot counter
+	(void)(gAlertCfg.log ? ALERTLOG_Use() : ALERTLOG_Init());
 
 	DFU_WatchdogArm(true);
 
@@ -1454,11 +1625,11 @@ void APP_RunAlert(void)
 		{
 			// A console command, or the log pre-erase the console runs, can
 			// hold the loop for up to ~300 ms (a sector erase): a squelch edge
-			// first seen after that is marked like one after a settings save.
+			// first seen after that long is marked like one after a settings
+			// save. A LOG DUMP's few lines a poll are not.
 			const uint32_t t0 = SCHEDULER_Ticks10ms();
 			ALERTCON_Poll();
-			if (SCHEDULER_Ticks10ms() - t0 > 1u)
-				blocked = true;
+			Stalled(t0);
 		}
 		dbgRawKey = (int16_t)key;
 		dbgRawPtt = GPIO_IsPttPressed() ? 1u : 0u;

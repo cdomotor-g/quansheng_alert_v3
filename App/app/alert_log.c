@@ -40,9 +40,10 @@
  * the seq it would have had goes to the next record. Headers work the same way.
  *
  * Boot counter: the head header's boot plus the number of bitmap bits cleared
- * since. ALERTLOG_Init clears one bit once per boot (a one-byte write, no
+ * since. ALERTLOG_Use clears one bit once per boot (a one-byte write, no
  * erase); a sector whose 96 bits are used gets a successor with the count in
- * its header. The counter only moves on boots that use the log.
+ * its header. The counter only moves on boots that use the log: with LOG OFF
+ * nothing here writes at all (ALERTLOG_Init only reads), and the boot is 0.
  *
  * LOG CLEAR and FORMAT open a new sector flagged CLEAR: records older than
  * its first seq no longer count. One erase instead of 96, and seq keeps
@@ -105,6 +106,7 @@ enum { ST_OFF = 0, ST_OK, ST_FOREIGN, ST_ERR, ST_BLANK };
 
 static uint8_t  sState;
 static bool     sInit;          // ALERTLOG_Init has run this boot
+static bool     sUsed;          // ... and so has ALERTLOG_Use (or a Format): sBoot is this boot's
 static bool     sNextErased;    // sector sHead + 1 was erased this boot, ready to enter
 static bool     sEraseDue;      // ... and it is time to do that (ALERTLOG_Idle)
 static uint8_t  sHead;          // the sector the next record goes to
@@ -159,6 +161,22 @@ static bool SlotBlank(uint8_t sec, uint8_t slot)
 	LogRec_t r;
 	PY25Q16_ReadBuffer(SlotAddr(sec, slot), &r, sizeof(r));
 	return AllFF(&r, sizeof(r));
+}
+
+// Every byte, not the sector heads Scan samples: ~1.5 ms per 4 KB sector.
+bool ALERT_FlashBlank(uint32_t addr, uint32_t len)
+{
+	uint8_t b[64];
+
+	while (len) {
+		const uint8_t n = (uint8_t)(len < sizeof(b) ? len : sizeof(b));
+		PY25Q16_ReadBuffer(addr, b, n);
+		if (!AllFF(b, n))
+			return false;
+		addr += n;
+		len  -= n;
+	}
+	return true;
 }
 
 // Read all 96 headers (32 bytes each, a few ms): the head is the largest gen,
@@ -257,49 +275,65 @@ static bool Open(uint8_t sec, uint8_t flags)
 	return true;
 }
 
-// This boot's number: one more bit of the head's bitmap. The lowest set bit
-// of the first byte that has one goes to 0 - a program, never an erase.
-static void Bump(void)
+// This boot's number into sBoot: the head's boot plus the bitmap bits used
+// since, plus one. Returns the first bitmap byte with a bit left, BUMP_BYTES
+// when all 96 are used, 0xFF when the head's header does not read back.
+static uint8_t BootNow(LogHdr_t *h)
 {
-	LogHdr_t h;
-	uint8_t  used = 0, spare = BUMP_BYTES;
+	uint8_t used = 0, spare = BUMP_BYTES;
 
-	if (!HdrRead(sHead, &h)) {
-		sState = ST_ERR;
-		return;
-	}
+	if (!HdrRead(sHead, h))
+		return 0xFFu;
 	for (uint8_t i = 0; i < BUMP_BYTES; i++) {
 		for (uint8_t m = 1; m; m = (uint8_t)(m << 1))
-			if (!(h.bumps[i] & m))
+			if (!(h->bumps[i] & m))
 				used++;
-		if (spare == BUMP_BYTES && h.bumps[i])
+		if (spare == BUMP_BYTES && h->bumps[i])
 			spare = i;
 	}
-	sBoot = (uint16_t)(h.boot + used + 1u);
+	sBoot = (uint16_t)(h->boot + used + 1u);
+	return spare;
+}
 
-	if (spare == BUMP_BYTES) {
+// This boot's number, kept: one more bit of the head's bitmap. The lowest set
+// bit of the first byte that has one goes to 0 - a program, never an erase.
+static void Bump(void)
+{
+	LogHdr_t      h;
+	const uint8_t spare = BootNow(&h);
+
+	if (spare == 0xFFu) {
+		sState = ST_ERR;
+	} else if (spare == BUMP_BYTES) {
 		// all 96 used: the next sector carries the count in its header
 		(void)Open(NextSector(sHead), 0);
-		return;
+	} else {
+		const uint8_t v = h.bumps[spare] & (uint8_t)(h.bumps[spare] - 1u);
+		PY25Q16_WriteBuffer(SlotAddr(sHead, 0) + offsetof(LogHdr_t, bumps) + spare, &v, 1, false);
 	}
-	const uint8_t v = h.bumps[spare] & (uint8_t)(h.bumps[spare] - 1u);
-	PY25Q16_WriteBuffer(SlotAddr(sHead, 0) + offsetof(LogHdr_t, bumps) + spare, &v, 1, false);
 }
 
 bool ALERTLOG_Init(void)
 {
-	// Once per boot, whoever asks first (app entry or the console): the boot
-	// counter must move once per power-up, not once per visit to the app.
-	if (sInit)
-		return sState == ST_OK;
-	sInit = true;
+	// Once per boot, whoever asks first (app entry or the console), and it
+	// only reads: LOG OFF leaves the region alone. ALERTLOG_Use writes.
+	if (!sInit) {
+		sInit = true;
+		Scan();
+	}
+	return sState == ST_OK;
+}
 
-	Scan();
-	if (sState == ST_BLANK) {
-		sBoot = 1;
-		(void)ALERTLOG_Format(false);
-	} else if (sState == ST_OK) {
-		Bump();
+bool ALERTLOG_Use(void)
+{
+	(void)ALERTLOG_Init();
+	// The boot counter moves once per power-up, not once per visit to the app.
+	if (!sUsed) {
+		sUsed = true;
+		if (sState == ST_BLANK)
+			(void)ALERTLOG_Format(false);
+		else if (sState == ST_OK)
+			Bump();
 	}
 	return sState == ST_OK;
 }
@@ -348,9 +382,14 @@ void ALERTLOG_Idle(void)
 	if (!sEraseDue || sState != ST_OK)
 		return;
 	sEraseDue = false;
-	PY25Q16_SectorErase(SlotAddr(NextSector(sHead), 0));
 	sNextErased = true;
-	Scan();                 // that sector held the oldest records
+	// sNextErased does not survive a reboot, but the erase it stood for does:
+	// a few ms of reads instead of erasing a blank sector again
+	const uint32_t addr = SlotAddr(NextSector(sHead), 0);
+	if (!ALERT_FlashBlank(addr, LOG_SECTOR)) {
+		PY25Q16_SectorErase(addr);
+		Scan();             // that sector held the oldest records
+	}
 }
 
 uint32_t ALERTLOG_Count(void)
@@ -443,7 +482,7 @@ bool ALERTLOG_ReadBack(uint32_t back, AlertRecord_t *r, uint32_t *seq)
 
 uint16_t ALERTLOG_Boot(void)
 {
-	return sState == ST_OK ? sBoot : 0;
+	return (sState == ST_OK && sUsed) ? sBoot : 0;
 }
 
 bool ALERTLOG_Clear(void)
@@ -457,7 +496,8 @@ bool ALERTLOG_Clear(void)
 // 95 sectors are then erased one by one as the ring reaches them.
 bool ALERTLOG_Format(bool force)
 {
-	uint8_t sec;
+	LogHdr_t h;
+	uint8_t  sec;
 
 	(void)ALERTLOG_Init();
 	if (sState == ST_FOREIGN && !force)
@@ -465,12 +505,23 @@ bool ALERTLOG_Format(bool force)
 
 	if (sState == ST_OK || sState == ST_ERR) {
 		sec = NextSector(sHead);
+		// Not used yet this boot (LOG OFF): the new header carries this
+		// boot's number rather than a bit of the old head's bitmap
+		if (!sUsed && sState == ST_OK)
+			(void)BootNow(&h);
 	} else {
+		// Blank going by the sector heads (Scan). Before the first write, every
+		// byte: data whose sector heads happen to be 0xFF is still someone's.
+		if (!force && !ALERT_FlashBlank(LOG_BASE, (uint32_t)LOG_SECTORS * LOG_SECTOR)) {
+			sState = ST_FOREIGN;
+			return false;
+		}
 		sec   = 0;
 		sNext = 1;
 		sGen  = 0;
 		sNextErased = false;
 	}
+	sUsed = true;
 	if (!sBoot)
 		sBoot = 1;
 	return Open(sec, HDR_CLEAR);

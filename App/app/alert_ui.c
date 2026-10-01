@@ -138,7 +138,9 @@ static void FormatValue(char *out, uint16_t value, uint8_t kind, bool full)
 // 12s, 4m, 3h, 2d: at most four characters. From the UTC clock when the
 // record and the radio both have it, else from uptime - which only compares
 // within one boot, so an earlier boot's record without a timestamp has no
-// age ("-", and false).
+// age ("-", and false). The RAM ring holds this boot's records only (it is
+// emptied at app entry), whatever boot number they carry: the log can go to
+// ERR, or be formatted, and renumber the boot under them.
 static bool Age(char *out, const AlertRecord_t *r)
 {
 	static const uint32_t unit[4] = { 1u, 60u, 3600u, 86400u };
@@ -148,7 +150,7 @@ static bool Age(char *out, const AlertRecord_t *r)
 
 	if (r->epoch && now >= r->epoch) {
 		s = now - r->epoch;
-	} else if (r->boot == ALERTLOG_Boot()) {
+	} else if (!srcLog || r->boot == ALERTLOG_Boot()) {
 		s = (ALERT_UptimeMs() - r->uptime_ms) / 1000u;
 	} else {
 		strcpy(out, "-");
@@ -419,6 +421,15 @@ void ALERTUI_DrawStatus(void)
 	ST7565_BlitStatusLine();
 }
 
+void ALERTUI_MarkRx(void)
+{
+	if (newN)
+		return;                       // +N keeps the field until the list is back at the top
+	memset(gStatusLine + ST_MARK_X, 0, ST_MARK_W * CHAR_PX);
+	Status("RX", ST_MARK_X, ST_MARK_W);
+	ST7565_BlitStatusLine();
+}
+
 // ---------------------------------------------------------------------------
 // main view
 
@@ -441,11 +452,12 @@ static void DrawEmpty(void)
 	Text(s, 0, 1);
 	sprintf(s, "NF %d dBm", ALERT_NoiseFloor());
 	Text(s, 0, 2);
-	{	// counters too long together for the spelt-out form get the short one
+	{	// counters too long together for the spelt-out form get the short
+		// one: 2 + 5 + 5 + 5 = 17 at most, bursts being 16-bit
 		const unsigned bursts = ALERT_Bursts();
 		const unsigned dec    = (unsigned)(ALERT_Decodes() > 99999u ? 99999u : ALERT_Decodes());
 		if (sprintf(s, "BURSTS %u  DEC %u", bursts, dec) > (int)UI_COLS)
-			sprintf(s, "BST %u DEC %u", bursts, dec);
+			sprintf(s, "B %u DEC %u", bursts, dec);
 		Text(s, 0, 3);
 	}
 	// the census result and what became of it: "AUD PA4B+ REJ" is 13
@@ -573,8 +585,9 @@ static void DrawSettings(void)
 		const uint8_t idx = (uint8_t)(first + i);
 		ALERT_SetValue(idx, v);
 		// 1 + 9 + 8 = 18: the longest name ("SQL LEVEL") and the longest value
-		// ("2 COPIES", "PENDING") together fill the row.
-		sprintf(s, "%c%-9s%s", idx == setIndex ? '>' : ' ', ALERT_SetName(idx), v);
+		// ("2 COPIES") together fill the row. Values to the right, so a
+		// nine-character name is never run into its value.
+		sprintf(s, "%c%-9s%8s", idx == setIndex ? '>' : ' ', ALERT_SetName(idx), v);
 		Text(s, 0, (uint8_t)(1u + i));
 	}
 	DrawScrollBar(setIndex, nset);
@@ -652,12 +665,14 @@ void ALERTUI_Key(KEY_Code_t key, bool held)
 		const uint8_t nset = ALERT_SetCount();
 		if (held) {
 			// A held UP/DOWN repeats every 100 ms: worth it for a number
-			// (FREQ, SQL LEVEL, SNR REQ), but it would flip an OFF/ON row
-			// back and forth under the finger.
+			// (FREQ, SQL LEVEL, SNR REQ), but it would flip any other row
+			// back and forth under the finger - "2 COPIES" starts with a
+			// digit too, so the whole value has to be one.
 			char v[12];
 			ALERT_SetValue(setIndex, v);
-			if (v[0] < '0' || v[0] > '9')
-				return;
+			for (const char *c = v; *c; c++)
+				if ((*c < '0' || *c > '9') && *c != '.')
+					return;
 		}
 		switch (key) {
 			case KEY_UP:   ALERT_SetStep(setIndex, +1); break;

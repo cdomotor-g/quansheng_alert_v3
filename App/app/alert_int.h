@@ -119,12 +119,26 @@ const char *ALERT_AudName(void);         // census pin: "NONE", "PA4", "PA4B", "
 // it never touches the BK4819 or the speaker: the rows that would - FREQ,
 // SQL LEVEL, CENSUS - return false and change nothing, as does a read-only
 // row, and SPEAKER changes the setting only. It saves nothing: follow it with
-// ALERT_SettingsChanged, which outside the app updates gEeprom but leaves the
-// flash write to the next settings save (the persist request is the loop's).
+// ALERT_SettingsChanged, which in the app saves at the next quiet moment and
+// outside it (nothing else there would) at once.
 uint8_t     ALERT_SetCount(void);
 const char *ALERT_SetName(uint8_t row);
 void        ALERT_SetValue(uint8_t row, char *out);   // out: >= 9 bytes
 bool        ALERT_SetStep(uint8_t row, int dir);      // false: not changed (see above)
+// SET <name> <value> (the console): the row straight to that value, spelt as
+// ALERT_SetValue gives it ('_' for a space, either case), numbers in the
+// row's own units - FREQ MHz goes to the nearest 12.5 kHz channel. Nothing
+// changes unless the whole value is valid; a change is saved and sent as one
+// EVT SET, the receiver retuned once. NULL when done (or already so), else
+// the console's ERR reason: ARGS (no such value for this row), RANGE,
+// READONLY or NOTINAPP (as ALERT_SetStep refuses outside the app).
+const char *ALERT_SetTo(uint8_t row, const char *value);
+
+// True when [addr, addr + len) of the SPI flash reads all 0xFF, every byte
+// (alert_log.c). The log and the station table read a region through with
+// it before their first write, so the FOREIGN rule (V2_SPEC 8) is not just a
+// sample of sector heads.
+bool        ALERT_FlashBlank(uint32_t addr, uint32_t len);
 
 // CSV (V2_SPEC 6), shared with the console so its CSV HDR and LOG DUMP match
 // what the app emits. Every line is at most ALERT_LINE_MAX characters, CRLF
@@ -146,6 +160,10 @@ void    ALERTUI_Draw(void);                      // [spec] current view, then bl
 void    ALERTUI_Key(KEY_Code_t key, bool held);  // [spec] UI-level keys
 void    ALERTUI_Tick10ms(void);                  // [spec] marquee, idle snap-back
 void    ALERTUI_DrawStatus(void);                // status line only (every 100 ms)
+// The squelch has just opened: RX into the header's marker field (unless +N
+// holds it) and that line alone blitted, ~1.4 ms. alert.c calls it before a
+// burst's sampling starts; everything else waits for the squelch to shut.
+void    ALERTUI_MarkRx(void);
 uint8_t ALERTUI_View(void);                      // ALERT_VIEW_*
 void    ALERTUI_Reset(void);                     // app entry: main view, top of the list
 // The entry the list (or the detail view) is on, as entries back from the

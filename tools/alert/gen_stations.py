@@ -90,7 +90,9 @@ BLOB_VERSION = 1
 BLOB_HEADER = struct.Struct("<4sHHII16s")
 BLOB_SITE = struct.Struct("<HHI")
 BLOB_NAME_MAX = 40             # ALERT_NAME_MAX in alert_stn.h
-BLOB_MAX_BYTES = 0x20000       # 0x1C0000-0x1DFFFF
+# 0x1C0000-0x1DFFFF less its last 32 bytes, where the firmware keeps the
+# mark that says the region is its own (alert_stn.c)
+BLOB_MAX_BYTES = 0x20000 - 32
 BLOB_NAME_OK = re.compile(r"^[A-Z0-9 /.\-&']+$")
 
 # Ordered classification rules. "RN/Rep" and "Rain/Rep" must land on RAIN, so rain wins
@@ -723,7 +725,7 @@ def check_blob(data):
     if not 0 < count < 0xFFFF:
         problems.append("count %d" % count)
     if len(data) > BLOB_MAX_BYTES:
-        problems.append("%d bytes, over the %d-byte region" % (len(data), BLOB_MAX_BYTES))
+        problems.append("%d bytes, over the %d-byte limit" % (len(data), BLOB_MAX_BYTES))
     if names_at + names_len != len(data):
         problems.append("header says %d bytes, file has %d" % (names_at + names_len, len(data)))
     if problems:
@@ -774,7 +776,7 @@ def check_blob(data):
             problems.append("id %d: lookup gives %r, the table says %r" % (aid, got, expected.get(aid)))
             if len(problems) > 40:
                 break
-    summary = ("%s: %d sites, %d addresses, %d bytes of names, %d bytes (%.1f%% of 128 KB), "
+    summary = ("%s: %d sites, %d addresses, %d bytes of names, %d bytes (%.1f%% of the limit), "
                "crc %08X" % (source.decode("ascii", "replace"), count, len(expected), names_len,
                              len(data), 100.0 * len(data) / BLOB_MAX_BYTES, crc))
     return problems, summary

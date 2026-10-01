@@ -37,15 +37,19 @@ bool        ALERTSTN_Lookup(uint16_t id, char *name, uint8_t name_max, uint8_t *
 // "BUILTIN MegaNet:95f6f8d" or "SPI MegaNet:xxxxxxx"
 const char *ALERTSTN_Source(void);
 // Validates the SPI table once per boot (its CRC over up to 128 KB, ~0.2 s);
-// later calls return at once. Until it has run, lookups use the built-in.
+// later calls return at once. The app calls it at entry; Lookup, Source and
+// Count call it themselves, so the console outside the app sees the table too.
 void        ALERTSTN_Init(void);
 uint16_t    ALERTSTN_Count(void);        // sites in the table in use
 
 // Console-facing upload (section 8 blob). BEGIN's crc32 is zlib's CRC32 of
 // the whole blob, header included - the transfer check; END then also checks
-// the blob's own header and body CRC before the table is used. From BEGIN on,
-// lookups use the built-in table. Writes erase each 4 KB sector the first
-// time they reach it (one erase per call at most in order, ~40-300 ms).
+// the blob's own header and body CRC before the table is used. A blob is at
+// most 131,040 bytes: the region's last 32 hold its end mark (alert_stn.c).
+// From BEGIN on, lookups use the built-in table. Writes erase each 4 KB
+// sector the first time they reach it, and one that starts past the sectors
+// reached so far is refused (false), so a write of up to 4 KB erases once at
+// most (~40-300 ms).
 bool ALERTSTN_UploadBegin(uint32_t len, uint32_t crc32);
 bool ALERTSTN_UploadWrite(uint32_t off, const uint8_t *p, uint16_t n);
 bool ALERTSTN_UploadEnd(void);          // verify the CRC, activate

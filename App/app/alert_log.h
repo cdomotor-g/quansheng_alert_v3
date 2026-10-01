@@ -5,10 +5,15 @@
  * one 32-byte header slot and 127 32-byte record slots each.
  *
  * Every function is cheap except where noted: the slow things a NOR flash
- * does (a 4 KB sector erase, 40-300 ms) happen in ALERTLOG_Init once per
- * boot at most, in ALERTLOG_Append when it crosses into a sector that was
- * not pre-erased, in ALERTLOG_Idle, and in Clear/Format. Never more than one
- * erase per call, so no call blocks for more than ~300 ms.
+ * does (a 4 KB sector erase, 40-300 ms) happen in ALERTLOG_Use once per boot
+ * at most, in ALERTLOG_Append when it crosses into a sector that was not
+ * pre-erased, in ALERTLOG_Idle, and in Clear/Format. Never more than one
+ * erase per call, so no call blocks for more than ~300 ms (plus, once ever,
+ * ~0.2 s reading a blank region through before it is first formatted).
+ *
+ * ALERTLOG_Init only reads; it is the log as it stands, for the console and
+ * the screens. ALERTLOG_Use is "LOG is on": alert.c calls it at app entry and
+ * before an append, and until then nothing here writes the region.
  */
 #ifndef APP_ALERT_LOG_H
 #define APP_ALERT_LOG_H
@@ -32,9 +37,16 @@ const char *ALERTLOG_State(void);           // "OK", "OFF", "FOREIGN", "ERR"
 // unusable. The CSV DEC line's seq is this when logging (V2_SPEC section 6).
 uint32_t ALERTLOG_NextSeq(void);
 
+// LOG is on: this boot uses the log. The first call per boot formats a blank
+// region (one erase) or moves the boot counter on (a one-byte write; one
+// erase every 96 boots); later calls only return. Until it has run,
+// ALERTLOG_Boot is 0 (V2_SPEC 2: "0 if no log"). True when the log is usable.
+bool     ALERTLOG_Use(void);
+
 // Pre-erase the sector the ring will enter next, once the current one is half
 // full, so the Append that crosses into it does not have to. One sector erase
-// at most (40-300 ms), and only when one is due: call it at a quiet moment
+// at most (40-300 ms), none when that sector already reads blank (as after a
+// reboot), and only when one is due: call it at a quiet moment
 // (alert_console.c does, with the squelch shut for a second).
 void     ALERTLOG_Idle(void);
 

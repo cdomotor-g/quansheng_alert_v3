@@ -10,14 +10,20 @@
  *   names   NUL-terminated, <= 40 chars, uppercase, no commas; name_off
  *           counts from the first of them
  *
- * Ownership, like the log's: a region whose first sector does not start with
- * "ASTB" is FOREIGN unless the first 32 bytes of all 32 sectors are 0xFF, and
- * a foreign region is never written until STN FORMAT FORCE. Every write here
- * therefore keeps "ASTB" + version at 0x1C0000: a clear, or the start of an
- * upload, erases sector 0 and writes those six bytes straight back (count and
- * the rest left 0xFF: "cleared"), and an upload may not change them. A power
- * cut mid-upload leaves a table of ours that fails its CRC, never a region
- * that looks like someone else's.
+ * Ownership, like the log's: a region with neither of our two marks is
+ * FOREIGN unless it reads blank, and a foreign region is never written until
+ * STN FORMAT FORCE. The marks are "ASTB" + version at 0x1C0000, and the same
+ * six bytes in the region's last 32 (0x1DFFE0), which no blob may reach. A
+ * clear, or the start of an upload, writes the end mark if it is missing,
+ * then erases sector 0 and writes its six bytes straight back (count and the
+ * rest left 0xFF: "cleared"); an upload may not change them, and one that
+ * reaches the last sector puts the end mark back right after erasing it. So
+ * at every moment one mark or the other is in flash: a power cut mid-erase
+ * or mid-upload leaves a table of ours that fails its checks (BAD), never a
+ * region that looks like someone else's.
+ *
+ * "Blank" is judged from the first 32 bytes of each sector at boot (Validate),
+ * and from every byte before the first claim of a region (Claimable).
  *
  * Copyright 2026 cdomotor-g. Apache-2.0, like the egzumer base it lives in.
  */
@@ -25,6 +31,7 @@
 
 #include <string.h>
 
+#include "app/alert_int.h"
 #include "app/alert_stn.h"
 #include "app/alert_stations_gen.h"   // static tables: this must stay its only includer
 #include "driver/py25q16.h"
@@ -33,6 +40,8 @@
 #define STN_SIZE     0x20000u
 #define STN_SECTOR   0x1000u
 #define STN_VERSION  1u
+#define MARK_ADDR    (STN_BASE + STN_SIZE - 32u)   // the end mark
+#define BLOB_MAX     (STN_SIZE - 32u)              // 131,040: a blob stops short of it
 
 typedef struct {
 	char     magic[4];      // "ASTB"
@@ -54,9 +63,10 @@ _Static_assert(sizeof(StnSite_t) == 8, "V2_SPEC section 8 site record");
 
 #define SITES_ADDR   (STN_BASE + sizeof(StnHdr_t))
 
-enum { ST_UNCHECKED = 0, ST_BUILTIN, ST_SPI, ST_BAD, ST_FOREIGN };
+// ST_BLANK: the built-in in use over a region that has never been ours
+enum { ST_UNCHECKED = 0, ST_BUILTIN, ST_SPI, ST_BAD, ST_FOREIGN, ST_BLANK };
 
-// What sector 0 always starts with once the region is ours.
+// Our mark: what sector 0 starts with once the region is ours, and the end mark.
 static const uint8_t kClaim[6] = { 'A', 'S', 'T', 'B', STN_VERSION, 0 };
 
 static uint8_t  sState;
@@ -100,17 +110,26 @@ static bool RegionBlank(void)
 	return true;
 }
 
+static bool Marked(void)
+{
+	uint8_t b[sizeof(kClaim)];
+
+	PY25Q16_ReadBuffer(MARK_ADDR, b, sizeof(b));
+	return memcmp(b, kClaim, sizeof(b)) == 0;
+}
+
 static void Validate(void)
 {
 	StnHdr_t h;
 
 	PY25Q16_ReadBuffer(STN_BASE, &h, sizeof(h));
-	sState = ST_BUILTIN;
 	if (memcmp(&h, kClaim, 4) != 0) {
-		if (!RegionBlank())
-			sState = ST_FOREIGN;
+		// sector 0 is not ours - but with the end mark it was, and a claim
+		// was cut short between its erase and its write
+		sState = Marked() ? ST_BAD : (RegionBlank() ? ST_BLANK : ST_FOREIGN);
 		return;
 	}
+	sState = ST_BUILTIN;
 	if (h.count == 0xFFFFu && h.names_len == 0xFFFFFFFFu)
 		return;                          // cleared: the built-in by choice
 
@@ -118,7 +137,7 @@ static void Validate(void)
 	if (h.version != STN_VERSION || h.count == 0 || h.names_len > STN_SIZE)
 		return;
 	const uint32_t body = (uint32_t)h.count * sizeof(StnSite_t) + h.names_len;
-	if (body > STN_SIZE - sizeof(h) || Crc32Flash(SITES_ADDR, body) != h.crc32)
+	if (body > BLOB_MAX - sizeof(h) || Crc32Flash(SITES_ADDR, body) != h.crc32)
 		return;
 
 	sCount = h.count;
@@ -134,11 +153,25 @@ static void Validate(void)
 	sState = ST_SPI;
 }
 
-// Sector 0 erased and "ASTB" + version written back: ours, and empty.
+// Ours, and empty. The end mark first (the driver's write does nothing when
+// it is there already), so a power cut in the erase of sector 0 that follows
+// still leaves one mark; then sector 0 erased and "ASTB" + version written back.
 static void Claim(void)
 {
+	PY25Q16_WriteBuffer(MARK_ADDR, kClaim, sizeof(kClaim), false);
 	PY25Q16_SectorErase(STN_BASE);
 	PY25Q16_WriteBuffer(STN_BASE, kClaim, sizeof(kClaim), false);
+}
+
+// May the region be claimed? Never a foreign one unless forced. One that is
+// blank going by its sector heads is read through first: data whose sector
+// heads happen to be 0xFF is still someone's (V2_SPEC 8).
+static bool Claimable(bool force)
+{
+	ALERTSTN_Init();
+	if (sState == ST_BLANK && !force && !ALERT_FlashBlank(STN_BASE, STN_SIZE))
+		sState = ST_FOREIGN;
+	return force || sState != ST_FOREIGN;
 }
 
 // Binary search for the last site whose base_id <= id; a site covers base_id
@@ -213,6 +246,10 @@ bool ALERTSTN_Lookup(uint16_t id, char *name, uint8_t name_max, uint8_t *kind)
 
 	if (name && name_max)
 		name[0] = 0;
+	// The app validates at entry; the console can get here first (a LOG DUMP
+	// before the app has run this boot), and must not name from the built-in
+	// a record the SPI table named when it was decoded.
+	ALERTSTN_Init();
 	if (sState == ST_SPI) {
 		hit = SpiFind(id, name, name_max, &k);
 	} else {
@@ -234,6 +271,7 @@ bool ALERTSTN_Lookup(uint16_t id, char *name, uint8_t name_max, uint8_t *kind)
 
 const char *ALERTSTN_Source(void)
 {
+	ALERTSTN_Init();
 	return sState == ST_SPI ? sSource : "BUILTIN " ALERT_STATIONS_SOURCE;
 }
 
@@ -245,6 +283,7 @@ void ALERTSTN_Init(void)
 
 uint16_t ALERTSTN_Count(void)
 {
+	ALERTSTN_Init();
 	return sState == ST_SPI ? sCount : ALERT_STATIONS_COUNT;
 }
 
@@ -255,14 +294,13 @@ uint32_t ALERTSTN_Crc(void)
 
 const char *ALERTSTN_State(void)
 {
-	static const char *const names[] = { "BUILTIN", "BUILTIN", "SPI", "BAD", "FOREIGN" };
+	static const char *const names[] = { "BUILTIN", "BUILTIN", "SPI", "BAD", "FOREIGN", "BUILTIN" };
 	return names[sState];
 }
 
 bool ALERTSTN_UploadBegin(uint32_t len, uint32_t crc32)
 {
-	ALERTSTN_Init();
-	if (sState == ST_FOREIGN || len <= sizeof(StnHdr_t) || len > STN_SIZE)
+	if (len <= sizeof(StnHdr_t) || len > BLOB_MAX || !Claimable(false))
 		return false;
 	Claim();                    // the old table is gone from here: built-in until END
 	sState    = ST_BUILTIN;
@@ -281,11 +319,18 @@ bool ALERTSTN_UploadWrite(uint32_t off, const uint8_t *p, uint16_t n)
 	for (uint32_t i = off; i < sizeof(kClaim) && i < off + n; i++)
 		if (p[i - off] != kClaim[i])
 			return false;
-	// Each sector is erased the first time the upload reaches it: in order,
-	// that is one erase per 64 STN W lines, never more than one per call.
+	// Each sector is erased the first time the upload reaches it, and a write
+	// may not start past the sectors reached so far: in order, so with the
+	// console's 64 bytes at most that is one erase per call (40-300 ms) - a
+	// jump to the end would be thirty, seconds with the loop and the
+	// watchdog stopped.
+	if (off > sUpErased)
+		return false;
 	while (sUpErased < off + n) {
 		PY25Q16_SectorErase(STN_BASE + sUpErased);
 		sUpErased += STN_SECTOR;
+		if (sUpErased == STN_SIZE)       // the last sector: its end mark goes straight back
+			PY25Q16_WriteBuffer(MARK_ADDR, kClaim, sizeof(kClaim), false);
 	}
 	PY25Q16_WriteBuffer(STN_BASE + off, p, n, false);
 	return true;
@@ -313,8 +358,7 @@ bool ALERTSTN_UploadEnd(void)
 
 bool ALERTSTN_Format(bool force)
 {
-	ALERTSTN_Init();
-	if (sState == ST_FOREIGN && !force)
+	if (!Claimable(force))
 		return false;
 	sUpLen = 0;
 	Claim();

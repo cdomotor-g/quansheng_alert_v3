@@ -554,7 +554,7 @@ class TestStationBlob(unittest.TestCase):
         self.assertEqual(list(at.stn_commands(b'')), ['STN BEGIN 0 00000000', 'STN END'])
 
     def test_line_lengths(self):
-        big = bytes(at.STN_REGION)
+        big = bytes(at.STN_BLOB_MAX)
         longest32 = max(len(c) for c in at.stn_commands(big, 32))
         longest64 = max(len(c) for c in at.stn_commands(big, 64))
         self.assertLessEqual(longest32, at.MAX_CMD)          # 32-byte chunks always fit
@@ -628,6 +628,7 @@ class FakeRadio(object):
         self.mute = False            # never answer
         self.double_final = False    # a second bare ERR after ERR,<reason>
         self.fail_end = False
+        self.foreign = False         # the station region holds someone else's data
 
     # pyserial's side
     @property
@@ -728,11 +729,14 @@ class FakeRadio(object):
 
     def c_STN(self, w, up):
         sub = up[1]
+        if self.foreign and sub in ('BEGIN', 'CLEAR'):
+            return self.err('FOREIGN')
         if sub == 'BEGIN':
             n, crc = int(w[2]), int(w[3], 16)
-            if n > at.STN_REGION:
+            if n > at.STN_BLOB_MAX:
                 return self.err('RANGE')
             self.upload, self.crc = bytearray(b'\xff' * n), crc
+            self.reached = 4096           # the firmware erases as it goes, in order
         elif sub == 'W':
             if self.upload is None:
                 return self.err('STATE')
@@ -740,8 +744,10 @@ class FakeRadio(object):
                 off, data = int(w[2]), bytes.fromhex(w[3])
             except (ValueError, IndexError):
                 return self.err('ARGS')
-            if not 1 <= len(data) <= 64 or off + len(data) > len(self.upload):
+            if not 1 <= len(data) <= 64 or off + len(data) > len(self.upload) or off > self.reached:
                 return self.err('STATE')
+            while self.reached < off + len(data):
+                self.reached += 4096
             self.upload[off:off + len(data)] = data
         elif sub == 'END':
             if self.upload is None:
@@ -750,8 +756,6 @@ class FakeRadio(object):
                 self.upload = None
                 return self.err('CRC')
             self.stn, self.upload = bytes(self.upload), None
-            self.say('OK', 'EVT,,400000,STN,SPI MegaNet:test123 4')
-            return
         elif sub == 'INFO':
             self.say('STN,SPI MegaNet:test123,4,00000000' if self.stn else
                      'STN,BUILTIN MegaNet:95f6f8d,443,')
@@ -851,6 +855,19 @@ class TestConsole(unittest.TestCase):
         self.assertEqual(at.upload_stations(link, blob, note=lambda s: None), 32)
         self.assertEqual(self.radio.stn, blob)
 
+    def test_upload_writes_in_order(self):
+        # the radio refuses a write past the sectors it has reached (one erase
+        # per line); the client's chunks never skip ahead
+        link = self.link(FakeRadio(max_line=160))
+        blob = build_test_blob(SITES * 100)
+        self.assertGreater(len(blob), 2 * 4096)
+        at.upload_stations(link, blob, note=lambda s: None)
+        self.assertEqual(self.radio.stn, blob)
+        link.command('STN BEGIN %d 00000000' % len(blob))
+        with self.assertRaises(at.ConsoleError) as cm:
+            link.command('STN W 8192 00')
+        self.assertEqual(cm.exception.reason, 'STATE')
+
     def test_upload_real_failure_is_raised(self):
         link = self.link(FakeRadio(max_line=160))
         self.radio.fail_end = True
@@ -949,6 +966,14 @@ class TestCommandLine(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.radio.stn, blob)
         self.assertIn('STN,SPI MegaNet:test123', out)
+
+    def test_foreign_region_names_the_way_out(self):
+        radio = FakeRadio()
+        radio.foreign = True
+        rc, out = self.run_main(['stations-clear', '--yes'], radio)
+        self.assertEqual(rc, 1)
+        self.assertIn('ERR,FOREIGN', out)
+        self.assertIn('STN FORMAT FORCE', out)
 
     def test_clear_needs_yes(self):
         with unittest.mock.patch('builtins.input', return_value='no'):

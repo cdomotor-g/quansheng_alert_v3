@@ -166,8 +166,8 @@ come from the ALERT app, so they flow only while the app runs. The console
 ### 5.1 HDR: the schema
 
 Sent when the ALERT app starts, on `CSV HDR`, and again after every 200
-record lines, so a client that joins mid-stream learns the schema within 200
-lines. The automatic ones follow `CSV_OUT`; `CSV HDR` answers either way.
+record lines of any type (`DEC`, `BST`, `STA`, `EVT`), so a client that joins
+mid-stream learns the schema within 200 lines. The automatic ones follow `CSV_OUT`; `CSV HDR` answers either way.
 
 ```
 HDR,fw,4d06107f,schema,2
@@ -179,8 +179,9 @@ HDR,EVT,epoch,uptime_ms,code,detail
 
 ### 5.2 DEC: one decoded frame
 
-One line per frame delivered: after de-duplication and the CONFIRM rule, and
-excluding unknown addresses while UNKNOWN=HIDE. A burst can carry several
+One line per frame delivered: after de-duplication and the CONFIRM rule. Every
+such frame is sent, in the table or not: UNKNOWN=HIDE only keeps unknown
+addresses off the screen and out of the voice. A burst can carry several
 frames. They share `uptime_ms` and are numbered by `frame`.
 
 | # | Field | Type | Unit | Range | Meaning |
@@ -188,7 +189,7 @@ frames. They share `uptime_ms` and are numbered by `frame`.
 | 1 | seq | u32 | | ≥ 1 | Log sequence number while LOG=ON and the log is usable; otherwise a per-boot counter starting at 1 † |
 | 2 | epoch | u32 | s | empty, or Unix time | UTC at squelch close. Empty when the clock was not set (TIME, section 7). Treat 0 as empty. |
 | 3 | uptime_ms | u32 | ms | | Time since boot at squelch close, in 10 ms steps. The burst's BST line has the same value. |
-| 4 | boot | u16 | | empty, or 1-65535 | Boot counter kept by the log; empty when there is no usable log |
+| 4 | boot | u16 | | empty, or 1-65535 | Boot counter kept by the log; empty when there is no usable log, or LOG is OFF |
 | 5 | id | int | | 0-8191 | ALERT address (13 bits) |
 | 6 | name | text | | ≤ 40 chars | Station name: uppercase, commas replaced by spaces, empty when the id is not in the table. Built-in table names are cut to 13 characters; uploaded names are full. |
 | 7 | kind | text | | `RAIN` `LVL` `BATT` `REP` `SNSR` `CHK` or empty | What the station table says this address reports; empty when unknown † |
@@ -295,8 +296,8 @@ the end of the line.
 | `BOOT` | The app started after a reset; detail is the reset reason (`POR` `SW` `WD` `FAULT`) and the boot counter |
 | `CENSUS` | The audio route: detail is the pin, `pa=` 0/1 and the route's state (`ON`, `CONFIRM`, `OFF`, `REJECT`, or `SAVED` for a choice kept from before) |
 | `SET` | A setting changed (keypad or console); detail is `NAME=value`, the name as the console spells it |
-| `LOG` | The log's state and fill (`OK 1045/12065`), at app entry and when it changes; `APPEND FAIL` when a record could not be written |
-| `STN` | The station table in use and its site count, at app entry and when it changes |
+| `LOG` | The log's state and fill (`OK 1045/12065`), at app entry; `APPEND FAIL` when a record could not be written. A console `LOG CLEAR`/`LOG FORMAT` sends none: its `OK` says it, and `LOG STAT` gives the state. |
+| `STN` | The station table in use and its site count, at app entry. A console upload or clear sends none: `STN INFO` gives the table in use. |
 | `CLOCK` | The clock was set: detail `SET` the first time, then `STEP <seconds>` (how far it moved) |
 
 ```
@@ -314,9 +315,9 @@ EVT,1790844100,402000,STN,SPI MegaNet:95f6f8d 2604
 |---|---|
 | DEC, BST | Shortly after the squelch closes at the end of a burst. Nothing is sent while the squelch is open: a USB send blocks, and the burst sampler must not be held up. |
 | STA | Every 10 s while the ALERT app runs |
-| HDR | When the app starts, on `CSV HDR`, and after every 200 record lines |
+| HDR | When the app starts, on `CSV HDR`, and after every 200 record lines of any type |
 | EVT | As it happens |
-| Console reply | Polled on every pass of the ALERT app's loop, and every 10 ms in normal radio operation. The console does nothing while the squelch is open and for 100 ms after it closes, so a reply can be held back by up to about 2 s. |
+| Console reply | Polled on every pass of the ALERT app's loop, and every 10 ms in normal radio operation. The console does nothing while the squelch is open and for 100 ms after it closes, so a reply can be held back by up to about 2 s; nor while the radio transmits (normal radio operation), however long that is. |
 
 Recommended client timeouts. Each is an idle timeout: restart it on every
 reply line, so a long `LOG DUMP` never times out while lines keep coming.
@@ -352,22 +353,26 @@ terminal: `python -m serial.tools.miniterm COM5 115200`.
 - Every command gets exactly one final line: `OK`, `OK,<detail>` or
   `ERR,<reason>` †. Any reply data lines come before it. Records and debug
   lines may appear anywhere in between.
+- A byte outside printable ASCII (other than TAB, backspace/DEL, CR, LF and
+  the binary frames of section 10) is dropped and spoils its line: an arrow
+  key's escape sequence, say, gets that line `ERR,ARGS` †. A line of nothing
+  but such bytes gets no reply, like an empty one.
 
 ### 7.2 Errors
 
 | Reply | Meaning † |
 |---|---|
 | `ERR,UNKNOWN` | No such command in this build |
-| `ERR,ARGS` | An argument is missing or malformed |
+| `ERR,ARGS` | An argument is missing or malformed, or the line held a byte outside printable ASCII |
 | `ERR,TOOLONG` | The line was over the limit and was discarded |
 | `ERR,NAME` | `SET`/`GET`: no setting by that name |
 | `ERR,RANGE` | A value is outside what the setting or command allows |
 | `ERR,READONLY` | That setting cannot be changed (`MDM_MODE`) |
 | `ERR,NOTINAPP` | That setting acts on the receiver: only while the ALERT app runs (see 7.4) |
-| `ERR,FOREIGN` | `STN BEGIN`/`STN CLEAR`: the station region holds data that is not ours (see `STN FORMAT FORCE`) |
+| `ERR,FOREIGN` | `STN BEGIN`/`STN CLEAR`: the station region holds data that is not ours (see `STN FORMAT FORCE`). An interrupted upload or clear of ours never causes it: that reads as state `BAD`. |
 | `ERR,CONFIRM` | A destructive command without its `YES` / `FORCE` |
 | `ERR,NOLOG` | The log is not usable (state OFF, FOREIGN or ERR) |
-| `ERR,STATE` | `STN W`/`STN END` without a `STN BEGIN`, or a write outside the announced length |
+| `ERR,STATE` | `STN W`/`STN END` without a `STN BEGIN`, a write outside the announced length, or one that starts past the 4 KB sectors the upload has reached so far (out of order, section 8) |
 | `ERR,CRC` | `STN END`: the uploaded bytes do not match the CRC; nothing was activated |
 | `ERR,FLASH` | An SPI flash erase, program or verify failed |
 
@@ -385,16 +390,16 @@ command".
 | `TIME <epoch>` | none | Sets the UTC clock: decimal Unix seconds, RAM only. Emits `EVT ... CLOCK`. |
 | `CSV HDR` | the HDR block (record lines) | Sends the section 5.1 block again |
 | `GET [name]` | `GET,<NAME>,<value>` per setting | One setting, or all of them |
-| `SET <name> <value>` | none | Changes a setting and saves it. Emits `EVT ... SET`. |
+| `SET <name> <value>` | none | Changes a setting and saves it to flash (at once outside the app; inside it at the next quiet moment). Emits one `EVT ... SET` when the value changed, none when it already had that value. Section 7.4. |
 | `LOG STAT` | `LOG,<count>,<capacity>,<oldest_seq>,<newest_seq>,<state>` | Log status; seq fields are empty when the log is empty |
-| `LOG DUMP [n]` | `LOG,<the 21 DEC fields>` per record | The newest n records (default all), oldest first |
+| `LOG DUMP [n]` | `LOG,<the 21 DEC fields>` per record | The newest n records (default all), oldest first. The log keeps each record's `rssi` and `nf` but not the SNR_REQ of the day: `sens` and `fade` are worked out again with the SNR_REQ set now, so they differ from the DEC line's if it has been changed since. `name`/`kind` come from the station table in use now. |
 | `LOG CLEAR YES` | none | Erases the log |
 | `LOG FORMAT FORCE` | none | Takes over a region that holds foreign data (state FOREIGN) and formats it |
 | `STN INFO` | `STN,<source>,<count>,<crc>,<state>` | Table in use. crc is the uploaded blob's header CRC (8 hex digits), empty for the built-in table. state: `SPI` (uploaded table in use), `BUILTIN` (region blank or cleared), `BAD` (an upload of ours that failed its checks), `FOREIGN` (not ours; uploads refused until `STN FORMAT FORCE`) |
 | `STN GET <id>` | `STN,<id>,<name>,<kind>` | One lookup; name and kind are empty when the id is not in the table |
 | `STN BEGIN <len> <crc32>` | none | Starts an upload (section 8): erases, expects len bytes |
 | `STN W <off> <hex>` | none | Writes bytes at offset off of the upload |
-| `STN END` | none | Checks the CRC and activates the new table. Emits `EVT ... STN`. |
+| `STN END` | none | Checks the CRC and activates the new table |
 | `STN CLEAR YES` | none | Erases the uploaded table and reverts to the built-in one |
 | `STN FORMAT FORCE` | none | Takes over a station region that holds foreign data (uploads are refused until then), like `LOG FORMAT FORCE` † |
 | `SCREEN` | 8 × `SCR,<row>,<256 hex>` | The display, section 9 |
@@ -416,16 +421,22 @@ shapes of `HELP`, `INFO`, `TIME`, `GET`, `STN INFO` and `SPI` are †. The
 | `VOICE` | `OFF` `ON` | OFF | Read new readings out loud |
 | `SPEAKER` | `OFF` `SQL` `ON` | SQL | SQL = speaker on only while the squelch is open |
 | `CSV_OUT` | `OFF` `ON` | ON | The section 5 records. The console answers either way. |
-| `LOG` | `OFF` `ON` | ON | Append to the flash log (only when the log is usable) |
-| `UNKNOWN` | `SHOW` `HIDE` | SHOW | HIDE drops addresses that are not in the table, from the screen and from DEC |
+| `LOG` | `OFF` `ON` | ON | Append to the flash log (only when the log is usable). OFF writes nothing at all to the log region, not even the boot counter (`boot` is then empty); the console's `LOG CLEAR`/`LOG FORMAT` still do what they say. |
+| `UNKNOWN` | `SHOW` `HIDE` | SHOW | HIDE keeps addresses that are not in the table off the screen and out of the voice. DEC lines and the log still carry them. |
 | `CONFIRM` | `OFF` `2 COPIES` | OFF | Require the same reading twice in one burst |
 | `SQ_GATE` | `OFF` `ON` | ON | A burst must peak 15 dB over the floor to count |
-| `SNR_REQ` | `6`-`20` | 12 | dB over the noise floor assumed necessary to decode; used for `sens` |
+| `SNR_REQ` | `6`-`20` (whole dB) | 12 | dB over the noise floor assumed necessary to decode; used for `sens` |
 | `DEBUG` | `OFF` `ON` | OFF | Adds the `D` heartbeat and raw `A` lines |
 | `MDM_MODE` | `ADC` | ADC | Read-only |
-| `CENSUS` | the chosen audio pin, e.g. `PA4B`; `NOT RUN`, `PENDING` | | Re-running it is a keypad action (UP on the row) |
-| `FREQ_MHZ` | e.g. `151.500` | as stored | 12.5 kHz steps |
-| `SQL_LEVEL` | e.g. `3.0` | as stored | |
+| `CENSUS` | the chosen audio pin, e.g. `PA4B`; `NOT RUN`, `PENDING` | | `SET CENSUS +` (or UP on the row) re-runs it; no other value sets it (`ERR,ARGS`) |
+| `FREQ_MHZ` | `130`-`174`, e.g. `151.500` | as stored | Set to the nearest 12.5 kHz channel, in one retune |
+| `SQL_LEVEL` | `0.0`-`9.0`, e.g. `3.0` | as stored | |
+
+A value is checked whole before anything changes: a word the row does not
+have, or a number that is not plain digits with at most one `.` (no sign, no
+comma, nothing after it), is `ERR,ARGS`; a number outside the row's range is
+`ERR,RANGE`. `+` and `-` instead of a value step the row once, as UP and DOWN
+do on the settings screen.
 
 `FREQ_MHZ`, `SQL_LEVEL` and `CENSUS` retune the receiver, so the console can
 change them only while the ALERT app runs. Outside the app they answer
@@ -512,7 +523,6 @@ OK
 ERR,CONFIRM
 > LOG CLEAR YES
 OK
-EVT,1790844020,321500,LOG,OK 0/12065
 > LOG STAT
 LOG,0,12065,,,OK
 OK
@@ -528,7 +538,6 @@ OK
 ERR,NOLOG
 > LOG FORMAT FORCE
 OK
-EVT,,5890,LOG,OK 0/12065
 ```
 
 Station lookups, reads and errors:
@@ -599,17 +608,21 @@ per offset: bits 0-2 for base+0, up to bits 12-14 for base+4. The codes are
 ### Procedure
 
 1. **`STN BEGIN <len> <crc32>`.** `len` is the blob size in decimal bytes, at
-   most 131072. `crc32` is the zlib CRC-32 of all len bytes, as 8 hex digits
+   most 131040 (the region's last 32 bytes are the radio's own: they mark
+   the region as ours). `crc32` is the zlib CRC-32 of all len bytes, as 8 hex digits
    †. The radio erases the region: allow 30 s.
 2. **`STN W <off> <hex>`, once per chunk, in increasing offset order.**
    `off` is the decimal byte offset. `hex` is the chunk's bytes, 2 hex digits
    each, at most 64 bytes. Wait for each `OK` before sending the next line.
-   Write each byte once: flash cannot be rewritten without an erase.
+   Write each byte once: flash cannot be rewritten without an erase. A chunk
+   may skip bytes (they stay 0xFF), but one that starts past the 4 KB
+   sectors reached so far is refused with `ERR,STATE`: each line erases one
+   sector at most.
 3. **`STN END`.** The radio checks the CRC and activates the table.
    `STN INFO` then shows `SPI ...` (the next app entry's `EVT ... STN` too).
 
 **Chunk size.** The 96-character line limit (section 7.1) holds a 32-byte
-chunk (`STN W 131040 ` plus 64 hex digits is 77 characters). A 64-byte chunk
+chunk (`STN W 131008 ` plus 64 hex digits is 77 characters). A 64-byte chunk
 makes a 141-character line; this firmware takes it anyway, because it packs
 an `STN W` line's hex digits two to a byte as they arrive, so the limit only
 applies to the `STN W <off> ` part. alertterm starts at 64, and if any
@@ -617,8 +630,10 @@ applies to the `STN W <off> ` part. alertterm starts at 64, and if any
 a build without the packing.
 
 If an upload is interrupted, the erased region holds no valid table and the
-built-in table stays in use. Run the upload again. `STN CLEAR YES` erases an
-uploaded table on purpose.
+built-in table stays in use (`STN INFO` state `BAD`, even after a power cut in
+the middle of an erase). Run the upload again. `STN CLEAR YES` erases an
+uploaded table on purpose. State `FOREIGN` means the region holds data the
+radio did not write: `STN FORMAT FORCE` takes it over, if you are sure.
 
 ```
 > STN BEGIN 71076 9A3C51E0
@@ -847,7 +862,8 @@ change this page if it cannot.
 
 - **Final line.** Every console command ends with exactly one final line,
   `OK`, `OK,<detail>` or `ERR,<reason>`. The console does not echo, and an
-  empty line gets no reply.
+  empty line gets no reply. A line with a byte outside printable ASCII is
+  `ERR,ARGS` (silent if it had no text at all).
 - **Error reasons.** The set in section 7.2.
 - **Reply line shapes.** `HELP,<text>`; `INFO,<key>,<value>` (followed by the
   `GET` lines); `TIME,<epoch>` (empty when unset); `GET,<NAME>,<value>`;
@@ -855,6 +871,8 @@ change this page if it cannot.
   header crc32 and is empty for the built-in table (`INFO,stn` carries the
   same state after the count); `SPI,<addr 6 hex>,<≤ 32 bytes hex>`.
 - **Setting values.** `_` stands for a space in values as well as names.
+  A value is set in one go or not at all; `FREQ_MHZ` goes to the nearest
+  12.5 kHz channel.
   `FREQ_MHZ`, `SQL_LEVEL` and `CENSUS` answer `ERR,NOTINAPP` outside the app
   (they return false from `ALERT_SetStep` there); `MDM_MODE` `ERR,READONLY`.
 - **`STN BEGIN` crc.** The zlib CRC-32 of all len bytes, not the header's

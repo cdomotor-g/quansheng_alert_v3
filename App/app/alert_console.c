@@ -19,8 +19,11 @@
  *   (payload, CRC, 0xDC 0xBA) without looking at them. The binary parser
  *   zeroes a frame once it has consumed it, so a frame the console reaches
  *   late reads as zeros, which are ignored. Any other byte outside printable
- *   ASCII (K5Viewer packets, line noise) throws the line away up to the next
- *   CR/LF. A client should start with a bare CR: empty lines are silent.
+ *   ASCII (an arrow key's escape sequence, a K5Viewer keepalive, line noise)
+ *   is dropped and spoils its line: a line with text in it is answered
+ *   ERR,ARGS at its CR/LF, as every command gets its one final line, and one
+ *   with none is silent. A client should start with a bare CR: empty lines
+ *   are silent.
  *
  * The host sends one line and waits for its final OK/ERR: the ring has no
  * overflow check, and 256 bytes is under two STN W lines.
@@ -30,10 +33,13 @@
  * in, its hex digits are packed two to a byte into the same buffer, so a
  * 64-byte write (141 characters of text) fits.
  *
- * Nothing runs while a burst is on the air: see Busy(). A LOG DUMP goes out
- * a few records per poll, so the receiver keeps running under it. The log's
- * sector pre-erase (ALERTLOG_Idle) is run from here too, once the squelch has
- * been shut for a second. CSV HDR and the LOG DUMP lines are alert.c's own
+ * Nothing runs while a burst is on the air (see Busy()) or while the radio
+ * transmits: outside the app this runs from app.c's 10 ms slice, which is
+ * serviced during TX too, and an erase or a CRC pass here would hold PTT
+ * release and the TX timeout up for as long. A LOG DUMP goes out a few
+ * records per poll, so the receiver keeps running under it. The log's sector
+ * pre-erase (ALERTLOG_Idle) is run from here too, once the squelch has been
+ * shut for a second. CSV HDR and the LOG DUMP lines are alert.c's own
  * (ALERT_CsvHeader, ALERT_FormatRecord), so they match what the app sends.
  *
  * Copyright 2026 cdomotor-g. Apache-2.0, like the egzumer base it lives in.
@@ -70,7 +76,7 @@
 #define DUMP_PER_POLL  8u
 
 enum { M_TEXT = 0, M_JUNK, M_AB, M_LEN0, M_LEN1, M_SKIP };
-enum { E_LONG = 1, E_HEX = 2 };
+enum { E_LONG = 1, E_HEX = 2, E_BYTE = 4 };
 
 static char     sLine[CON_LINE];
 static uint8_t  sLen;
@@ -154,30 +160,6 @@ static bool Num(const char *s, uint32_t *v, uint8_t base)
 	return true;
 }
 
-// The leading number of a settings value in thousandths: "162.550" 162550,
-// "3.5" 3500, "12" 12000. False when it does not start with one.
-static bool Milli(const char *s, int32_t *v)
-{
-	int32_t    x = 0, unit = 1000;
-	const bool neg = (*s == '-');
-
-	if (neg)
-		s++;
-	if (*s < '0' || *s > '9')
-		return false;
-	while (*s >= '0' && *s <= '9' && x < 1000000)
-		x = x * 10 + (*s++ - '0');
-	x *= 1000;
-	if (*s == '.')
-		for (s++; *s >= '0' && *s <= '9'; s++)
-			if (unit > 1) {
-				unit /= 10;
-				x += (*s - '0') * unit;
-			}
-	*v = neg ? -x : x;
-	return true;
-}
-
 // The next space-separated token ("" at the end); *p moves past it.
 static char *Tok(char **p)
 {
@@ -239,12 +221,6 @@ static void SayRow(uint8_t row)
 	Say("GET,%s,%s\r\n", n, v);
 }
 
-static bool Step(uint8_t row, int dir)
-{
-	DFU_WatchdogKick();              // FREQ can take thousands of steps
-	return ALERT_SetStep(row, dir);
-}
-
 // Why ALERT_SetStep said no, from what alert_int.h says it refuses: the rows
 // that act on the receiver, outside the app (CENSUS only ever goes up); the
 // read-only row; a value at the end of its range.
@@ -260,73 +236,29 @@ static const char *Refusal(uint8_t row, int dir)
 }
 
 // SET <name> <value|+|->. + and - are one step, as UP/DOWN in the settings
-// view (SET CENSUS + re-runs the census). A value is reached by stepping: in
-// thousandths when both it and the row's value are numbers (FREQ MHz in
-// 12.5 kHz steps, SQL LEVEL, SNR REQ), else round the row's choices. One the
-// row cannot take is refused and the row put back as it was.
+// view (SET CENSUS + re-runs the census); a value is set in one go by
+// ALERT_SetTo, which checks all of it first and otherwise changes nothing.
 static void CmdSet(char *p)
 {
-	char          *name = Tok(&p);
-	const int8_t   row  = FindRow(name);
-	char           was[12], cur[12], prev[12];
-	int32_t        want = 0, now = 0, nx = 0;
-	int            dir  = 1;
-	bool           num;
-	const bool     one  = (p[0] == '+' || p[0] == '-') && !p[1];
-	const uint16_t limit = 4000u;    // FREQ's whole 130-174 MHz is 3,520 steps
+	char        *name = Tok(&p);
+	const int8_t row  = FindRow(name);
+	const char  *why;
 
 	if (row < 0 || !*p) {
 		Err(row < 0 ? "NAME" : "ARGS");
 		return;
 	}
-	ALERT_SetValue((uint8_t)row, was);
-	num = Milli(p, &want) && Milli(was, &now);
-
-	if (one) {
-		dir = (p[0] == '+') ? 1 : -1;
-	} else if (Same(was, p) || (num && want == now)) {
-		Ok();
-		return;
-	} else if (num) {
-		dir = want > now ? 1 : -1;
-	}
-	if (!Step((uint8_t)row, dir)) {
-		Err(Refusal((uint8_t)row, dir));
-		return;
-	}
-	if (!one) {
-		strcpy(prev, was);
-		for (uint16_t n = 1;; n++) {
-			ALERT_SetValue((uint8_t)row, cur);
-			if (num) {
-				// it has to move towards the value every step: not stuck at a
-				// limit, not wrapped round, not past it
-				if (!Milli(cur, &nx) || (dir > 0 ? (nx <= now || nx > want) : (nx >= now || nx < want)))
-					break;
-				if (nx == want)
-					goto done;
-				now = nx;
-			} else {
-				if (Same(cur, p))
-					goto done;
-				if (Same(cur, was) || Same(cur, prev))
-					break;              // round the choices, or stuck
-				strcpy(prev, cur);
-			}
-			if (n >= (num ? limit : 8u) || !Step((uint8_t)row, dir))
-				break;
+	if ((p[0] == '+' || p[0] == '-') && !p[1]) {
+		const int dir = (p[0] == '+') ? 1 : -1;
+		if (!ALERT_SetStep((uint8_t)row, dir)) {
+			Err(Refusal((uint8_t)row, dir));
+			return;
 		}
-		// not a value this row takes: back the way it came
-		for (uint16_t n = 0; n < limit; n++) {
-			ALERT_SetValue((uint8_t)row, cur);
-			if (Same(cur, was) || !Step((uint8_t)row, -dir))
-				break;
-		}
-		Err("RANGE");
+		ALERT_SettingsChanged();
+	} else if ((why = ALERT_SetTo((uint8_t)row, p)) != NULL) {
+		Err(why);
 		return;
 	}
-done:
-	ALERT_SettingsChanged();
 	Ok();
 }
 
@@ -535,7 +467,9 @@ static void CmdStnW(const char *off, const uint8_t *data, uint8_t n)
 		return;
 	}
 	if (!ALERTSTN_UploadWrite(x, data, n)) {
-		Err("ARGS");                     // a header that is not ASTB version 1
+		// the first six bytes: a header that is not ASTB version 1; past them,
+		// a write that skips ahead of the sectors reached so far
+		Err(x < 6u ? "ARGS" : "STATE");
 		return;
 	}
 	Ok();
@@ -671,7 +605,9 @@ static bool Feed(uint8_t b)
 	}
 
 	if (b == '\r' || b == '\n') {
-		const bool go = sMode == M_TEXT && (sLen || sErr);
+		// every error comes with text, so a line with none is silent: a bare
+		// CR, or nothing but stray bytes
+		const bool go = sMode == M_TEXT && sLen;
 		sMode = M_TEXT;
 		if (!go)
 			ResetLine();
@@ -694,8 +630,7 @@ static bool Feed(uint8_t b)
 		return false;
 	}
 	if (b < ' ' || b > '~') {
-		ResetLine();
-		sMode = M_JUNK;
+		sErr |= E_BYTE;
 		return false;
 	}
 	if (b >= 'a' && b <= 'z')
@@ -755,14 +690,15 @@ void ALERTCON_Poll(void)
 {
 	const uint32_t now = ALERT_UptimeMs();
 
-	if (Busy(now))
+	// Transmitting (outside the app: PTT leaves it): input waits in the ring
+	if (DFU_Transmitting() || Busy(now))
 		return;
 	if (sDumpLeft) {
 		DumpStep();
 		return;
 	}
-	// the log's pre-erase, a second into a quiet spell, never mid-transmission
-	if (!sSqOpen && now - sSqEdge >= 1000u && !DFU_Transmitting())
+	// the log's pre-erase, a second into a quiet spell
+	if (!sSqOpen && now - sSqEdge >= 1000u)
 		ALERTLOG_Idle();
 
 	// the USB driver can leave its write index at 256, the end of the ring

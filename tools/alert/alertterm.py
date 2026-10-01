@@ -48,6 +48,7 @@ VID = 0x36B7            # App/usb/usbd_cdc_if.c; the stock bootloader enumerates
 SCHEMA = 2              # the HDR schema this client was written for
 MAX_CMD = 96            # console line limit, V2_SPEC section 7
 STN_REGION = 0x20000    # the 128 KB station region, V2_SPEC section 8
+STN_BLOB_MAX = STN_REGION - 32   # its last 32 bytes are the radio's ownership mark
 STN_MAX_CHUNK = 64      # STN W carries at most 64 bytes
 SILENCE_S = 25.0        # STA arrives every 10 s: this long without a byte, re-assert DTR
 
@@ -291,8 +292,8 @@ def check_blob(blob):
     """Header plus the checks the radio will make -> (header, [problems])."""
     hdr = parse_blob_header(blob)
     problems = []
-    if len(blob) > STN_REGION:
-        problems.append('%d bytes is over the %d-byte station region' % (len(blob), STN_REGION))
+    if len(blob) > STN_BLOB_MAX:
+        problems.append('%d bytes is over the %d-byte station blob limit' % (len(blob), STN_BLOB_MAX))
     need = ASTB.size + 8 * hdr['count'] + hdr['names_len']
     if len(blob) < need:
         problems.append('%d bytes, but the header describes %d' % (len(blob), need))
@@ -357,10 +358,10 @@ def build_blob(args):
         else:
             filt = args.filter or DEFAULT_FILTER
         # --out points into the temp dir so a blob run can never touch the
-        # generated header in the tree; --max-bytes is the region, not the
-        # 8 KB built-in table limit
+        # generated header in the tree; --max-bytes is the blob limit, not
+        # the 8 KB built-in table limit
         cmd = [sys.executable, gen, '--blob', out, '--filter', filt,
-               '--out', os.path.join(td, 'unused.h'), '--max-bytes', str(STN_REGION)]
+               '--out', os.path.join(td, 'unused.h'), '--max-bytes', str(STN_BLOB_MAX)]
         if args.meganet_dir:
             cmd += ['--meganet-dir', args.meganet_dir]
         print('building the station blob: %s' % ' '.join(cmd[1:]), flush=True)
@@ -1055,6 +1056,10 @@ def main(argv=None):
         return args.fn(args)
     except (LinkError, ConsoleError, ConsoleTimeout) as e:
         print('alertterm: %s' % e, file=sys.stderr)
+        if isinstance(e, ConsoleError) and e.reason == 'FOREIGN':
+            print('alertterm: the station region holds data this firmware did not write. '
+                  'If you are sure nothing else uses 0x1C0000-0x1DFFFF, take it over with\n'
+                  '  alertterm.py console   then   STN FORMAT FORCE', file=sys.stderr)
         return 1
     except OSError as e:            # pyserial's SerialException is one: the port went away
         print('alertterm: serial port: %s' % e, file=sys.stderr)

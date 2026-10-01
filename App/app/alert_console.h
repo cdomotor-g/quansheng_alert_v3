@@ -11,7 +11,8 @@
 
 // Called every loop pass inside the ALERT app AND from app.c's 10 ms slice
 // outside it, so the console answers in normal radio operation too. Does
-// nothing while the squelch is open (up to 2 s) or for 100 ms after it shuts.
+// nothing while the squelch is open (up to 2 s) or for 100 ms after it shuts,
+// nor while the radio transmits.
 void ALERTCON_Poll(void);
 
 #endif
