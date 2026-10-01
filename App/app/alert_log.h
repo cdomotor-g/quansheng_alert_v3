@@ -1,7 +1,7 @@
 /* ALERT receiver: the decode log, a ring of records in SPI flash.
  *
  * Region and record format: tools/alert/V2_SPEC.md section 8, and the
- * layout comment at the top of alert_log.c. 0x160000-0x1BFFFF, 96 sectors of
+ * layout comment at the top of alert_log.c. 0x1B0000-0x1DFFFF, 48 sectors of
  * one 32-byte header slot and 127 32-byte record slots each.
  *
  * Every function is cheap except where noted: the slow things a NOR flash

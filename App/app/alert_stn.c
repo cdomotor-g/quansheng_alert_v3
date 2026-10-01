@@ -1,6 +1,6 @@
 /* ALERT receiver: station-name lookup - see alert_stn.h.
  *
- * The SPI table, 0x1C0000-0x1DFFFF (128 KB; why that region is free: the map
+ * The SPI table, 0x1A0000-0x1AFFFF (64 KB; why that region is free: the map
  * at the top of alert_log.c), little-endian, as gen_stations.py --blob writes it:
  *
  *   header  "ASTB", u16 version 1, u16 count, u32 names_len,
@@ -12,8 +12,8 @@
  *
  * Ownership, like the log's: a region with neither of our two marks is
  * FOREIGN unless it reads blank, and a foreign region is never written until
- * STN FORMAT FORCE. The marks are "ASTB" + version at 0x1C0000, and the same
- * six bytes in the region's last 32 (0x1DFFE0), which no blob may reach. A
+ * STN FORMAT FORCE. The marks are "ASTB" + version at 0x1A0000, and the same
+ * six bytes in the region's last 32 (0x1AFFE0), which no blob may reach. A
  * clear, or the start of an upload, writes the end mark if it is missing,
  * then erases sector 0 and writes its six bytes straight back (count and the
  * rest left 0xFF: "cleared"); an upload may not change them, and one that
@@ -36,12 +36,12 @@
 #include "app/alert_stations_gen.h"   // static tables: this must stay its only includer
 #include "driver/py25q16.h"
 
-#define STN_BASE     0x1C0000u
-#define STN_SIZE     0x20000u
+#define STN_BASE     0x1A0000u
+#define STN_SIZE     0x10000u
 #define STN_SECTOR   0x1000u
 #define STN_VERSION  1u
 #define MARK_ADDR    (STN_BASE + STN_SIZE - 32u)   // the end mark
-#define BLOB_MAX     (STN_SIZE - 32u)              // 131,040: a blob stops short of it
+#define BLOB_MAX     (STN_SIZE - 32u)              // 65,504: a blob stops short of it
 
 typedef struct {
 	char     magic[4];      // "ASTB"

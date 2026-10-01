@@ -1,7 +1,7 @@
 /* ALERT receiver: station-name lookup for decoded addresses.
  *
  * Two sources, one lookup (tools/alert/V2_SPEC.md section 8): a table uploaded
- * over the console into SPI flash (0x1C0000-0x1DFFFF) when one is present and
+ * over the console into SPI flash (0x1A0000-0x1AFFFF) when one is present and
  * valid, else the table built into the image - app/alert_stations_gen.h,
  * generated from the MegaNet repository by tools/alert/gen_stations.py (never
  * edit that file). The SPI table is the blob `gen_stations.py --blob` writes;
@@ -36,7 +36,7 @@ enum {
 bool        ALERTSTN_Lookup(uint16_t id, char *name, uint8_t name_max, uint8_t *kind);
 // "BUILTIN MegaNet:95f6f8d" or "SPI MegaNet:xxxxxxx"
 const char *ALERTSTN_Source(void);
-// Validates the SPI table once per boot (its CRC over up to 128 KB, ~0.2 s);
+// Validates the SPI table once per boot (its CRC over up to 64 KB, ~0.1 s);
 // later calls return at once. The app calls it at entry; Lookup, Source and
 // Count call it themselves, so the console outside the app sees the table too.
 void        ALERTSTN_Init(void);
@@ -45,7 +45,7 @@ uint16_t    ALERTSTN_Count(void);        // sites in the table in use
 // Console-facing upload (section 8 blob). BEGIN's crc32 is zlib's CRC32 of
 // the whole blob, header included - the transfer check; END then also checks
 // the blob's own header and body CRC before the table is used. A blob is at
-// most 131,040 bytes: the region's last 32 hold its end mark (alert_stn.c).
+// most 65,504 bytes: the region's last 32 hold its end mark (alert_stn.c).
 // From BEGIN on, lookups use the built-in table. Writes erase each 4 KB
 // sector the first time they reach it, and one that starts past the sectors
 // reached so far is refused (false), so a write of up to 4 KB erases once at

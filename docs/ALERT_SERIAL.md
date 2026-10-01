@@ -277,11 +277,11 @@ DEC lines above with the same `uptime_ms`.
 | 10 | min_ok | int | dBm | | Weakest peak RSSI that decoded this boot; empty before the first decode |
 | 11 | log_state | text | | `OK` `OFF` `FOREIGN` `ERR` | The log: usable / not in use / region holds someone else's data / failed |
 | 12 | log_count | int | | 0-log_cap | Records in the log |
-| 13 | log_cap | int | | | Records the log can hold: 12065 in this build (95 of the 96 sectors × 127 records; one sector is always the next to be erased), 0 when the log is not usable |
+| 13 | log_cap | int | | | Records the log can hold: 5969 in this build (47 of the 48 sectors × 127 records; one sector is always the next to be erased), 0 when the log is not usable |
 | 14 | stn_src | text | | | Station table in use: `BUILTIN MegaNet:<hash>` or `SPI MegaNet:<hash>` |
 
 ```
-STA,1790843970,270000,-121,-124,0,7890,78,16,18,-104,OK,1045,12065,BUILTIN MegaNet:95f6f8d
+STA,1790843970,270000,-121,-124,0,7890,78,16,18,-104,OK,1045,5969,BUILTIN MegaNet:95f6f8d
 STA,,31000,-119,-122,0,7650,61,0,0,,FOREIGN,0,0,BUILTIN MegaNet:95f6f8d
 ```
 
@@ -296,7 +296,7 @@ the end of the line.
 | `BOOT` | The app started after a reset; detail is the reset reason (`POR` `SW` `WD` `FAULT`) and the boot counter |
 | `CENSUS` | The audio route: detail is the pin, `pa=` 0/1 and the route's state (`ON`, `CONFIRM`, `OFF`, `REJECT`, or `SAVED` for a choice kept from before) |
 | `SET` | A setting changed (keypad or console); detail is `NAME=value`, the name as the console spells it |
-| `LOG` | The log's state and fill (`OK 1045/12065`), at app entry; `APPEND FAIL` when a record could not be written. A console `LOG CLEAR`/`LOG FORMAT` sends none: its `OK` says it, and `LOG STAT` gives the state. |
+| `LOG` | The log's state and fill (`OK 1045/5969`), at app entry; `APPEND FAIL` when a record could not be written. A console `LOG CLEAR`/`LOG FORMAT` sends none: its `OK` says it, and `LOG STAT` gives the state. |
 | `STN` | The station table in use and its site count, at app entry. A console upload or clear sends none: `STN INFO` gives the table in use. |
 | `CLOCK` | The clock was set: detail `SET` the first time, then `STEP <seconds>` (how far it moved) |
 
@@ -326,7 +326,7 @@ reply line, so a long `LOG DUMP` never times out while lines keep coming.
 |---|---|
 | Most commands | 3 s |
 | `LOG DUMP` | 15 s idle |
-| `LOG CLEAR YES`, `LOG FORMAT FORCE` | 60 s (the flash erase covers 96 sectors) |
+| `LOG CLEAR YES`, `LOG FORMAT FORCE` | 30 s (the flash erase covers 48 sectors) |
 | `STN BEGIN`, `STN CLEAR YES`, `STN FORMAT FORCE` | 30 s |
 | `STN W` | 5 s (a line that enters a new 4 KB sector erases it first: 40-300 ms) |
 | `STN END` | 30 s (reads back and checks the CRC) |
@@ -461,7 +461,7 @@ INFO,epoch,1790843762
 INFO,batt_mv,7890
 INFO,batt_pct,78
 INFO,nf,-121
-INFO,log,OK,1040,12065
+INFO,log,OK,1040,5969
 INFO,stn,BUILTIN MegaNet:95f6f8d,443,BUILTIN
 GET,VOICE,OFF
 GET,SPEAKER,SQL
@@ -513,7 +513,7 @@ The log:
 
 ```
 > LOG STAT
-LOG,1045,12065,1,1045,OK
+LOG,1045,5969,1,1045,OK
 OK
 > LOG DUMP 2
 LOG,1044,1790843962,263880,12,4109,ROTHWELL,RAIN,1290,1290,tips,ABF,STD,1,0,-88,-121,-109,21,455,B202AB17,10110010000000101010101100010111
@@ -524,7 +524,7 @@ ERR,CONFIRM
 > LOG CLEAR YES
 OK
 > LOG STAT
-LOG,0,12065,,,OK
+LOG,0,5969,,,OK
 OK
 ```
 
@@ -552,7 +552,7 @@ OK
 > STN GET 3001
 STN,3001,,
 OK
-> SPI READ 0x1C0000 32
+> SPI READ 0x1A0000 32
 SPI,1C0000,4153544201002C0A24C40000610A8F3E4D6567614E65743A3935663666386400
 OK
 > STN END
@@ -581,7 +581,7 @@ OK
 The radio names stations from a table. The built-in one (`BUILTIN
 MegaNet:<hash>`) is compiled into the firmware and cut to 13-character names
 to fit. A larger table with full names can be uploaded into SPI flash
-(0x1C0000-0x1DFFFF, 128 KB). `tools/alert/gen_stations.py --blob out.bin`
+(0x1A0000-0x1AFFFF, 64 KB). `tools/alert/gen_stations.py --blob out.bin`
 builds one. With the filter `all`, it covers the whole of MegaNet (~2,600
 sites).
 
@@ -608,7 +608,7 @@ per offset: bits 0-2 for base+0, up to bits 12-14 for base+4. The codes are
 ### Procedure
 
 1. **`STN BEGIN <len> <crc32>`.** `len` is the blob size in decimal bytes, at
-   most 131040 (the region's last 32 bytes are the radio's own: they mark
+   most 65504 (the region's last 32 bytes are the radio's own: they mark
    the region as ours). `crc32` is the zlib CRC-32 of all len bytes, as 8 hex digits
    †. The radio erases the region: allow 30 s.
 2. **`STN W <off> <hex>`, once per chunk, in increasing offset order.**
@@ -622,8 +622,8 @@ per offset: bits 0-2 for base+0, up to bits 12-14 for base+4. The codes are
    `STN INFO` then shows `SPI ...` (the next app entry's `EVT ... STN` too).
 
 **Chunk size.** The 96-character line limit (section 7.1) holds a 32-byte
-chunk (`STN W 131008 ` plus 64 hex digits is 77 characters). A 64-byte chunk
-makes a 141-character line; this firmware takes it anyway, because it packs
+chunk (`STN W 65472 ` plus 64 hex digits is 76 characters). A 64-byte chunk
+makes a 140-character line; this firmware takes it anyway, because it packs
 an `STN W` line's hex digits two to a byte as they arrive, so the limit only
 applies to the `STN W <off> ` part. alertterm starts at 64, and if any
 `STN W` or the `STN END` is refused, starts over at 32 †, which also covers

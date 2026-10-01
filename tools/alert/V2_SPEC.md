@@ -249,7 +249,8 @@ and their index at 0x14C000-0x14CFFF, RX/TX log 0x1E0000-0x1E7FFF, foxhunt cfg
 (find its address). The implementer must grep every PY25Q16 address in the tree
 and confirm the regions below are unused by any code, then:
 
-- **Log**: 0x160000-0x1BFFFF (384 KB = 96 sectors). Records 32 bytes
+- **Log**: 0x1B0000-0x1DFFFF (192 KB = 48 sectors; moved 2026-10-01: this radio's
+  factory voice clips occupy 0x14D000-0x196FFF, found with SPI READ). Records 32 bytes
   (AlertRecord_t 24 B + seq u32 + crc16 + marker): 128 per sector, 12,288
   total. Ring: find head at init by scanning each sector's first/last seq
   (binary search acceptable); erase the next sector before crossing into it.
@@ -257,7 +258,7 @@ and confirm the regions below are unused by any code, then:
   At init: if the region has no `ALOG` magic and is not all 0xFF, state
   FOREIGN and do nothing until `LOG FORMAT FORCE`. Commit order must make a
   torn write detectable (write the record, then its marker byte).
-- **Stations**: 0x1C0000-0x1DFFFF (128 KB). Blob:
+- **Stations**: 0x1A0000-0x1AFFFF (64 KB; the whole of MegaNet is ~58 KB). Blob:
   `magic "ASTB", u16 version=1, u16 count, u32 names_len, u32 crc32(of everything after this header),
   char source[16]`, then `count` × `{u16 base_id, u16 kinds, u32 name_off}` sorted by base_id, then
   NUL-terminated names (≤ 40 chars, uppercase, commas → spaces). Kinds packing

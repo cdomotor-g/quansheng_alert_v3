@@ -118,21 +118,21 @@ EX = {
     'dec_lvl': 'DEC,1045,1790843967,268870,12,4110,ROTHWELL,LVL,12,12,,ABF,STD,1,0,-104,-121,-109,5,390,72029B03,01110010000000101001101100000011',
     'dec_unknown': 'DEC,7,,95230,,3001,,,57,57,,EIF,NEG,0,0,-61,-119,-107,46,380,9F753812,10011111011101010011100000010010',
     'bst': 'BST,14,1790843886,187340,-20,-121,412,1,100,0000003D2FCB08EE0109001060',
-    'sta': 'STA,1790843970,270000,-121,-124,0,7890,78,16,18,-104,OK,1045,12065,BUILTIN MegaNet:95f6f8d',
+    'sta': 'STA,1790843970,270000,-121,-124,0,7890,78,16,18,-104,OK,1045,5969,BUILTIN MegaNet:95f6f8d',
     'sta_noclock': 'STA,,31000,-119,-122,0,7650,61,0,0,,FOREIGN,0,0,BUILTIN MegaNet:95f6f8d',
     'evt': 'EVT,1790843790,91240,SET,SNR_REQ=14',
     'evt_boot': 'EVT,,5230,BOOT,POR 12',
     'hdr_fw': 'HDR,fw,4d06107f,schema,2',
     'hdr_dec': 'HDR,DEC,seq,epoch,uptime_ms,boot,id,name,kind,value,eng,unit,fmt,pol,inv,frame,rssi,nf,sens,fade,burst_ms,payload_hex,payload_bin',
-    'log_stat': 'LOG,1045,12065,1,1045,OK',
-    'log_empty': 'LOG,0,12065,,,OK',
+    'log_stat': 'LOG,1045,5969,1,1045,OK',
+    'log_empty': 'LOG,0,5969,,,OK',
     'log_dump': 'LOG,1044,1790843962,263880,12,4109,ROTHWELL,RAIN,1290,1290,tips,ABF,STD,1,0,-88,-121,-109,21,455,B202AB17,10110010000000101010101100010111',
     'stn_get': 'STN,2088,MARBURG,BATT',
     'stn_miss': 'STN,3001,,',
     'stn_info': 'STN,SPI MegaNet:95f6f8d,2604,3E8F0A61',
     'stn_builtin': 'STN,BUILTIN MegaNet:95f6f8d,443,',
     'get': 'GET,CONFIRM,2 COPIES',
-    'info_log': 'INFO,log,OK,1040,12065',
+    'info_log': 'INFO,log,OK,1040,5969',
     'time': 'TIME,1790843762',
     'spi': 'SPI,1C0000,4153544201002C0A24C40000610A8F3E4D6567614E65743A3935663666386400',
     'scr1': 'SCR,1,FF' + '00' * 126 + 'FF',
@@ -195,7 +195,7 @@ class TestDocExamples(unittest.TestCase):
                           r.num('batt_pct'), r.num('bursts'), r.num('decodes'), r.num('min_ok')),
                          (-121, -124, 0, 7890, 78, 16, 18, -104))
         self.assertEqual((r['log_state'], r.num('log_count'), r.num('log_cap'), r['stn_src']),
-                         ('OK', 1045, 12065, 'BUILTIN MegaNet:95f6f8d'))
+                         ('OK', 1045, 5969, 'BUILTIN MegaNet:95f6f8d'))
         r = at.parse_record(EX['sta_noclock'])
         self.assertIsNone(r.num('epoch'))
         self.assertIsNone(r.num('min_ok'))
@@ -229,7 +229,7 @@ class TestDocExamples(unittest.TestCase):
     def test_log_shapes(self):
         r = at.parse_record(EX['log_stat'])
         self.assertEqual((r.num('count'), r.num('capacity'), r.num('oldest_seq'),
-                          r.num('newest_seq'), r['state']), (1045, 12065, 1, 1045, 'OK'))
+                          r.num('newest_seq'), r['state']), (1045, 5969, 1, 1045, 'OK'))
         r = at.parse_record(EX['log_empty'])
         self.assertEqual((r.num('count'), r.num('oldest_seq'), r['state']), (0, None, 'OK'))
         r = at.parse_record(EX['log_dump'])
@@ -249,7 +249,7 @@ class TestDocExamples(unittest.TestCase):
     def test_console_data_lines(self):
         self.assertEqual(at.parse_record(EX['get'])['value'], '2 COPIES')
         r = at.parse_record(EX['info_log'])
-        self.assertEqual((r['key'], r['value']), ('log', 'OK,1040,12065'))
+        self.assertEqual((r['key'], r['value']), ('log', 'OK,1040,5969'))
         self.assertEqual(at.parse_record(EX['time']).num('epoch'), 1790843762)
         self.assertIsNone(at.parse_record('TIME,').num('epoch'))
         r = at.parse_record(EX['spi'])
@@ -558,9 +558,9 @@ class TestStationBlob(unittest.TestCase):
         longest32 = max(len(c) for c in at.stn_commands(big, 32))
         longest64 = max(len(c) for c in at.stn_commands(big, 64))
         self.assertLessEqual(longest32, at.MAX_CMD)          # 32-byte chunks always fit
-        self.assertEqual((longest32, longest64), (77, 141))  # the numbers the doc quotes
-        self.assertIn('is 77 characters', doc_text())
-        self.assertIn('141-character line', doc_text())
+        self.assertEqual((longest32, longest64), (76, 140))  # the numbers the doc quotes
+        self.assertIn('is 76 characters', doc_text())
+        self.assertIn('140-character line', doc_text())
 
 
 class TestLineReader(unittest.TestCase):
@@ -714,7 +714,7 @@ class FakeRadio(object):
 
     def c_LOG(self, w, up):
         if up[1] == 'STAT':
-            self.say('LOG,%d,12065,%s,%s,OK' % (len(self.log), self.log[0][0], self.log[-1][0]))
+            self.say('LOG,%d,5969,%s,%s,OK' % (len(self.log), self.log[0][0], self.log[-1][0]))
         elif up[1] == 'DUMP':
             n = int(up[2]) if len(up) > 2 else len(self.log)
             for i, rec in enumerate(self.log[-n:]):

@@ -13,18 +13,24 @@
  *   0x14C000-0x14CFFF  voice clip index (CN 0x14C000, EN       audio.c (ENABLE_VOICE; off in
  *                      0x14C800)                                the RescueOps ALERT build)
  *   0x14D000 + offset  voice clips                             audio.c, same
- *   0x160000-0x1BFFFF  this log (96 sectors)                   here
- *   0x1C0000-0x1DFFFF  ALERT station table                     alert_stn.c
+ *   0x1A0000-0x1AFFFF  ALERT station table                     alert_stn.c
+ *   0x1B0000-0x1DFFFF  this log (48 sectors)                   here
  *   0x1E0000-0x1E7FFF  RX/TX log                               rxtx_log.c (off in RescueOps)
  *
- * No code addresses 0x160000-0x1DFFFF except through one door: audio.c reads
+ * Read off this radio's flash on 2026-10-01 (console SPI READ, every 4 KB):
+ * the factory voice clips really do run from 0x14D000 to inside 0x196FFF, and
+ * 0x197000 onwards reads blank. The first layout put the log at 0x160000,
+ * squarely on the clips; the FOREIGN rule below refused it, which is how that
+ * was found. Both regions now start at 0x1A0000, 36 KB clear of the clips.
+ *
+ * No code addresses 0x1A0000-0x1DFFFF except through one door: audio.c reads
  * a clip at 0x14D000 + Offset with only a sanity bound (Offset <= 0x0B0000,
  * Size <= 0x019000), which on paper reaches 0x215FFF. Where the factory voice
  * data really ends is a property of the radio's flash, not of the code, and
  * cannot be proven from here. That is what the FOREIGN rule is for: a region
  * with no ALOG magic that is not blank is left alone until LOG FORMAT FORCE.
  *
- * Format (V2_SPEC section 8). 96 sectors of 4 KB, each 128 slots of 32 bytes:
+ * Format (V2_SPEC section 8). 48 sectors of 4 KB, each 128 slots of 32 bytes:
  * slot 0 is the sector header, slots 1-127 records, filled in order. The ring
  * moves one sector at a time; entering a sector erases it, which drops the
  * oldest 127 records.
@@ -65,14 +71,14 @@
 #include "driver/crc.h"
 #include "driver/py25q16.h"
 
-#define LOG_BASE     0x160000u
-#define LOG_SECTORS  96u
+#define LOG_BASE     0x1B0000u
+#define LOG_SECTORS  48u
 #define LOG_SECTOR   0x1000u
 #define SLOT_SIZE    32u
 #define SLOTS        (LOG_SECTOR / SLOT_SIZE)      // 128, slot 0 the header
 #define RECS         (SLOTS - 1u)                  // 127 records a sector
 // Kept whatever the ring's phase: one sector is always about to be erased.
-#define CAPACITY     ((LOG_SECTORS - 1u) * RECS)   // 12,065
+#define CAPACITY     ((LOG_SECTORS - 1u) * RECS)   // 5,969
 #define LOG_VERSION  1u
 #define COMMIT       0xA5u
 #define HDR_CLEAR    0x01u                         // flags: nothing before `first` counts

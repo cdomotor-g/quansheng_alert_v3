@@ -298,16 +298,25 @@ def gh_download(run_id, dest, repo, branch):
             return None
         print("  latest successful run: {}".format(run_id))
     dest = os.path.join(dest, str(run_id))
+
+    def find_bin():
+        for root, _dirs, files in os.walk(dest):
+            for f in files:
+                if f.endswith(".rescueops.bin"):
+                    return os.path.join(root, f)
+        return None
+
+    # A run's artifact never changes, and gh refuses to extract over files it
+    # already wrote, so a second flash of the same run reuses the first download.
+    if os.path.isdir(dest) and find_bin():
+        print("  using the artifact already downloaded to {}".format(dest))
+        return find_bin()
     os.makedirs(dest, exist_ok=True)
     cmd = ["gh", "run", "download", str(run_id), "-R", repo, "-p", ARTIFACT_PATTERN, "-D", dest]
     print("  $", " ".join(cmd))
     if subprocess.call(cmd) != 0:
         return None
-    for root, _dirs, files in os.walk(dest):
-        for f in files:
-            if f.endswith(".rescueops.bin"):
-                return os.path.join(root, f)
-    return None
+    return find_bin()
 
 
 def check_image(path):

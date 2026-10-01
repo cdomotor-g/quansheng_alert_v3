@@ -47,7 +47,7 @@ DEFAULT_FILTER = os.path.join(REPO, 'filters', 'stations.filter')
 VID = 0x36B7            # App/usb/usbd_cdc_if.c; the stock bootloader enumerates with it too
 SCHEMA = 2              # the HDR schema this client was written for
 MAX_CMD = 96            # console line limit, V2_SPEC section 7
-STN_REGION = 0x20000    # the 128 KB station region, V2_SPEC section 8
+STN_REGION = 0x10000    # the 64 KB station region, V2_SPEC section 8
 STN_BLOB_MAX = STN_REGION - 32   # its last 32 bytes are the radio's ownership mark
 STN_MAX_CHUNK = 64      # STN W carries at most 64 bytes
 SILENCE_S = 25.0        # STA arrives every 10 s: this long without a byte, re-assert DTR
@@ -319,7 +319,7 @@ def upload_stations(link, blob, chunk=STN_MAX_CHUNK, progress=None, note=print):
     """Upload with flow control (each line waits for its OK). Returns the
     chunk size that worked.
 
-    A 64-byte chunk is a 141-character line, over the console's 96-character
+    A 64-byte chunk is a 140-character line, over the console's 96-character
     limit. A build that holds to that limit refuses the line, or cuts it and
     then fails a later chunk or the CRC at END. So any refusal after BEGIN
     while the chunks are over 32 bytes restarts the whole upload once with
@@ -862,7 +862,7 @@ def cmd_log_clear(args):
         return 1
     link = connect(args)
     try:
-        link.command('LOG CLEAR YES', timeout=60.0)     # erases 96 sectors
+        link.command('LOG CLEAR YES', timeout=60.0)     # erases 48 sectors
     finally:
         link.close()
     print('log cleared')
@@ -1058,7 +1058,7 @@ def main(argv=None):
         print('alertterm: %s' % e, file=sys.stderr)
         if isinstance(e, ConsoleError) and e.reason == 'FOREIGN':
             print('alertterm: the station region holds data this firmware did not write. '
-                  'If you are sure nothing else uses 0x1C0000-0x1DFFFF, take it over with\n'
+                  'If you are sure nothing else uses 0x1A0000-0x1AFFFF, take it over with\n'
                   '  alertterm.py console   then   STN FORMAT FORCE', file=sys.stderr)
         return 1
     except OSError as e:            # pyserial's SerialException is one: the port went away

@@ -90,9 +90,9 @@ BLOB_VERSION = 1
 BLOB_HEADER = struct.Struct("<4sHHII16s")
 BLOB_SITE = struct.Struct("<HHI")
 BLOB_NAME_MAX = 40             # ALERT_NAME_MAX in alert_stn.h
-# 0x1C0000-0x1DFFFF less its last 32 bytes, where the firmware keeps the
+# 0x1A0000-0x1AFFFF less its last 32 bytes, where the firmware keeps the
 # mark that says the region is its own (alert_stn.c)
-BLOB_MAX_BYTES = 0x20000 - 32
+BLOB_MAX_BYTES = 0x10000 - 32
 BLOB_NAME_OK = re.compile(r"^[A-Z0-9 /.\-&']+$")
 
 # Ordered classification rules. "RN/Rep" and "Rain/Rep" must land on RAIN, so rain wins
