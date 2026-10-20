@@ -1,5 +1,12 @@
 # quansheng_alert for the UV-K5 V3 / UV-K1
 
+> ### Setting up a radio? Start at **[cdomotor-g.github.io/quansheng_alert_ALL](https://cdomotor-g.github.io/quansheng_alert_ALL/)**
+>
+> What to buy, how to tell a V3 from an older UV-K5, an installer that runs in
+> the browser and flashes this firmware over the radio's USB-C port, and a
+> guide to every screen, key and setting of the ALERT receiver. This repository
+> is the firmware source.
+
 > **This is a fork.** It adds an **ALERT telemetry receiver** — for receiving
 > flood-warning telemetry from ALERT network stations — on top of the excellent
 > [F4HWN Fusion port for the UV-K1 and UV-K5 V3](https://github.com/armel/uv-k1-k5v3-firmware-custom)
@@ -20,8 +27,10 @@
 > and is often model `UV-K5(99)`. The two are **not** interchangeable — flashing
 > the wrong one is the documented way to brick a radio.
 >
-> Flash a V3 with [UV Studio](https://armel.github.io/uvstudio/), **not** with
-> the quansheng_alert web installer, which targets V1 hardware only.
+> Flash a V3 with the [quansheng_alert_ALL installer](https://cdomotor-g.github.io/quansheng_alert_ALL/flash/?radio=v3),
+> which carries a current build of this firmware, or with
+> [UV Studio](https://armel.github.io/uvstudio/) and a `.bin` you built. The
+> older quansheng_alert web installer targets V1 hardware only.
 
 # Stats
 
