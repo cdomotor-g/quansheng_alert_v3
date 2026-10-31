@@ -1,0 +1,259 @@
+{
+  "$schema": "https://cdomotor-g.github.io/atlas/schema/atlas.schema.json",
+  "atlas": 1,
+  "id": "quansheng-v3",
+  "repo": "cdomotor-g/quansheng_alert_v3",
+  "name": "Quansheng ALERT receiver (UV-K5 V3 / UV-K1)",
+  "tagline": "ALERT flood-telemetry receiver firmware for the Quansheng UV-K5 V3 and UV-K1, a fork of F4HWN.",
+  "about": "A fork of the F4HWN firmware for the PY32F071 radios that adds an ALERT receiver app: it demodulates the 300-baud bursts on 151.5 MHz in software, decodes them, names the station from a table generated from Flood-Net's station list, logs to SPI flash and talks to a computer over USB-C. Our work is the app (App/app/alert_*), its host tools (tools/alert/, tools/hotflash.py), filters/ and docs/ALERT_SERIAL.md; everything else is upstream F4HWN. People get it through the quansheng_alert_ALL installer, and Flood-Net and RPi ALERT read it over serial.",
+  "kind": "radio firmware (F4HWN fork)",
+  "logo": "tools/alert/screens/v2-list.png",
+  "site": "https://cdomotor-g.github.io/quansheng_alert_ALL/",
+  "docs": {
+    "readme": "README.md",
+    "agents": "CLAUDE.md",
+    "serial": "docs/ALERT_SERIAL.md",
+    "spec": "tools/alert/V2_SPEC.md",
+    "notes": "tools/alert/README.md"
+  },
+  "status": {
+    "phase": "beta",
+    "updated": "2026-10-31",
+    "summary": "Receiver v2 decodes on air (22 of 22 bursts) and ships through quansheng_alert_ALL; no firmware work since 1 October, and its built-in station table is a month behind Flood-Net.",
+    "next": [
+      "Regenerate the built-in station table: Flood-Net now gives 451 sites, not 443",
+      "Record which Flood-Net commit the built-in table was generated from",
+      "Drop A2C's zero status-byte check; Flood-Net reads it as a time offset (cdomotor-g/MegaNet#209)",
+      "Send quansheng_alert_ALL a firmware-updated dispatch after each push to main"
+    ]
+  },
+  "components": [
+    {
+      "id": "alert-app",
+      "name": "ALERT receiver app",
+      "what": "The app behind the ALERT menu entry: burst capture, the screens, settings, speaker and voice, and the CSV records.",
+      "paths": [
+        "App/app/alert.c",
+        "App/app/alert.h",
+        "App/app/alert_int.h",
+        "App/app/alert_ui.c"
+      ],
+      "status": "beta"
+    },
+    {
+      "id": "demodulator",
+      "name": "Software AFSK demodulator",
+      "what": "Reads the receiver audio on PA4 with the ADC and turns 1300/2100 Hz, 300-baud bursts into bits, sampled mid-bit.",
+      "paths": [
+        "App/app/alert_adc.c",
+        "App/app/alert_adc.h"
+      ],
+      "status": "beta"
+    },
+    {
+      "id": "decoder",
+      "name": "Frame decoder",
+      "what": "Finds ABF and EIF frames in the bits (and decodes A2C records) by Flood-Net's packets.js layouts, with the idle gate and CRC-6.",
+      "paths": [
+        "App/app/alert_decode.c",
+        "App/app/alert_decode.h",
+        "tools/alert/test_decode.c"
+      ],
+      "status": "beta"
+    },
+    {
+      "id": "station-table",
+      "name": "Station table",
+      "what": "A built-in table of 443 South-East Queensland sites generated from Flood-Net, plus a fuller table that can be uploaded to SPI flash.",
+      "paths": [
+        "App/app/alert_stations_gen.h",
+        "App/app/alert_stn.c",
+        "App/app/alert_stn.h",
+        "tools/alert/gen_stations.py",
+        "filters/"
+      ],
+      "status": "beta"
+    },
+    {
+      "id": "spi-log",
+      "name": "SPI flash log",
+      "what": "A ring log of every decode in SPI flash, kept clear of the radio's voice clips and read back over USB.",
+      "paths": [
+        "App/app/alert_log.c",
+        "App/app/alert_log.h"
+      ],
+      "status": "beta"
+    },
+    {
+      "id": "console",
+      "name": "USB serial interface",
+      "what": "Text console and records over USB-C (schema 2): HDR, DEC, BST, STA, EVT, settings, log dump, station upload and screen capture.",
+      "paths": [
+        "App/app/alert_console.c",
+        "App/app/alert_console.h",
+        "docs/ALERT_SERIAL.md"
+      ],
+      "status": "beta"
+    },
+    {
+      "id": "host-tools",
+      "name": "Host tools",
+      "what": "alertterm.py (the reference client), hotflash.py for flashing over USB-C, and the capture, simulation and layout checks.",
+      "paths": [
+        "tools/alert/",
+        "tools/hotflash.py"
+      ],
+      "status": "beta"
+    },
+    {
+      "id": "ci",
+      "name": "CI build and checks",
+      "what": "Builds the RescueOps image with ENABLE_ALERT=ON, confirms the app is in it, and runs the decoder, layout and menu-wiring checks.",
+      "paths": [
+        ".github/workflows/main.yml"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "f4hwn-base",
+      "name": "F4HWN base firmware",
+      "what": "Upstream F4HWN Fusion port for the PY32F071 by muzkr and armel (Apache-2.0); the ALERT app hooks into its menu, keys and settings.",
+      "paths": [
+        "App/",
+        "Core/",
+        "Drivers/",
+        "Middlewares/",
+        "CMakeLists.txt",
+        "CMakePresets.json"
+      ],
+      "url": "https://github.com/armel/uv-k1-k5v3-firmware-custom"
+    }
+  ],
+  "provides": [
+    {
+      "id": "firmware",
+      "name": "ALERT firmware source (RescueOps build)",
+      "what": "The source quansheng_alert_ALL compiles every week: cmake --preset RescueOps -DENABLE_ALERT=ON gives build/RescueOps/f4hwn.rescueops.bin.",
+      "component": "alert-app",
+      "paths": [
+        "App/",
+        "Core/",
+        "Drivers/",
+        "Middlewares/",
+        "cmake/",
+        "CMakeLists.txt",
+        "CMakePresets.json",
+        "filters/stations.filter"
+      ],
+      "contract": ".github/workflows/main.yml"
+    },
+    {
+      "id": "serial-protocol",
+      "name": "ALERT serial interface, schema 2",
+      "what": "What the radio sends and accepts on USB-C: line format, records, DTR rule, console commands, screen capture. Flood-Net's quansheng.js and RPi ALERT implement it.",
+      "component": "console",
+      "paths": [
+        "docs/ALERT_SERIAL.md",
+        "tools/alert/V2_SPEC.md",
+        "App/app/alert_console.c",
+        "App/app/alert.c"
+      ],
+      "contract": "docs/ALERT_SERIAL.md"
+    },
+    {
+      "id": "station-blob",
+      "name": "SPI station-table blob",
+      "what": "The ASTB table format uploaded with the console's STN commands (section 8); Flood-Net's Serial Radio tab builds the same blob.",
+      "component": "station-table",
+      "paths": [
+        "docs/ALERT_SERIAL.md",
+        "tools/alert/gen_stations.py",
+        "App/app/alert_stn.c",
+        "App/app/alert_stn.h"
+      ],
+      "contract": "docs/ALERT_SERIAL.md"
+    },
+    {
+      "id": "logging-client",
+      "name": "alertterm.py",
+      "what": "Reference client: live table, log download as CSV, station upload, screenshots, console. The setup guide tells people to run it.",
+      "component": "host-tools",
+      "paths": [
+        "tools/alert/alertterm.py"
+      ],
+      "contract": "docs/ALERT_SERIAL.md"
+    },
+    {
+      "id": "screens",
+      "name": "Screen captures",
+      "what": "PNG captures of the v2 screens taken from the radio over SCREEN; the setup guide shows copies.",
+      "component": "alert-app",
+      "paths": [
+        "tools/alert/screens/"
+      ]
+    }
+  ],
+  "consumes": [
+    {
+      "id": "station-table",
+      "from": "flood-net",
+      "provider": "station-list",
+      "into": "station-table",
+      "what": "Station names, sensor kinds, ALERT addresses and repeater networks for the built-in table.",
+      "how": "generated",
+      "watch": [
+        "stations.json",
+        "data/All 2021 Working 2.txt",
+        "data/ALL_REPEATERS.csv"
+      ],
+      "since": {
+        "date": "2026-09-30"
+      },
+      "on_change": "python3 tools/alert/gen_stations.py --meganet-dir ../MegaNet --filter filters/stations.filter --out App/app/alert_stations_gen.h (8000-byte limit), then build and push. No Flood-Net commit is recorded: the header points at docs/firmware/manifest.json, which this repository does not have.",
+      "drift_issue": false
+    },
+    {
+      "id": "station-upload",
+      "from": "flood-net",
+      "provider": "station-list",
+      "into": "host-tools",
+      "what": "alertterm.py stations-upload reads Flood-Net's station files from main at run time to build the SPI table.",
+      "how": "live",
+      "url": "https://raw.githubusercontent.com/cdomotor-g/MegaNet/main/stations.json",
+      "watch": [
+        "stations.json",
+        "data/All 2021 Working 2.txt",
+        "data/ALL_REPEATERS.csv"
+      ],
+      "on_change": "Nothing to rebuild. If the files' layout changes (sensors, alert_ids, radio_networks), fix the parsers in tools/alert/gen_stations.py."
+    },
+    {
+      "id": "packet-formats",
+      "from": "flood-net",
+      "provider": "packet-formats",
+      "into": "decoder",
+      "what": "The ABF, EIF and A2C bit layouts and the CRC-6, mirrored bit for bit from packets.js FORMATS.",
+      "how": "protocol",
+      "watch": [
+        "packets.js"
+      ],
+      "since": {
+        "date": "2026-10-01"
+      },
+      "on_change": "Compare packets.js FORMATS with App/app/alert_decode.c; mirror any change and add a vector to tools/alert/test_decode.c."
+    },
+    {
+      "id": "setup-site",
+      "from": "quansheng-all",
+      "provider": "setup-site",
+      "what": "The README sends people to the setup guide and to the installer at /flash/?radio=v3.",
+      "how": "reference",
+      "watch": [
+        "docs/index.html",
+        "docs/flash/",
+        "docs/js/installer.js"
+      ],
+      "on_change": "Check the README's links to the guide and the installer still land."
+    }
+  ]
+}
