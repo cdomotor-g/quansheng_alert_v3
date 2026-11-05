@@ -7,7 +7,8 @@ firmware
 .cache
 compile_commands.json
 .vscode
-.claude
+.claude/*
+!.claude/settings.json
 .agents
 /docs
 k5_eeprom.raw
