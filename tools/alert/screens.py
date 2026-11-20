@@ -177,7 +177,7 @@ SCENARIOS = {
     # the detail view (1)
     'detail': main_view('two', 'key 1\ndraw detail\n'),
     # settings: the list, then a value being changed
-    'settings': main_view('two', 'key MENU\ndraw settings\n'),
+    'settings': main_view('two', 'key F\nkey F\nkey F\nkey MENU\ndraw settings\n'),   # F round to SQL, its note gone
     'settings-edit': main_view('two', 'key MENU\nkey MENU\nkey UP\ndraw settings-edit\n'),
     'settings-lower': main_view('two', 'key MENU\n' + 'key DOWN\n' * 7 + 'draw settings-lower\n'),
     # nothing heard yet, and the first seconds

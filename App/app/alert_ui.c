@@ -1067,9 +1067,10 @@ void ALERTUI_Key(KEY_Code_t key, bool held)
 			break;
 		case KEY_2:    view = ALERT_VIEW_MAIN; break;
 		case KEY_MENU:
-			view     = ALERT_VIEW_SETTINGS;
-			setIndex = 0;
-			editing  = false;
+			view      = ALERT_VIEW_SETTINGS;
+			setIndex  = 0;
+			editing   = false;
+			noteTicks = 0;            // a note from the list would cover two rows
 			break;
 		case KEY_EXIT:
 			if (view == ALERT_VIEW_DETAIL)
