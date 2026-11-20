@@ -65,6 +65,8 @@ static uint8_t  view;             // ALERT_VIEW_*
 static uint8_t  setIndex;         // selected settings row (an ALERT_Set* row number)
 static bool     editing;          // ... and its value is being changed
 static char     editWas[12];      // its value when MENU started the change, for EXIT
+static char     typed[12];        // a value being typed: the digits so far, '_' for the rest
+static uint8_t  typedN;           // digits typed so far; 0 = not typing
 static bool     srcLog;           // the list reads the SPI log, else the RAM ring
 static uint32_t top;              // back index the list starts at, 0 = newest
 static uint16_t newN;             // decodes that arrived while the list was held
@@ -835,6 +837,13 @@ static bool DrawDetail(void)
 // DOWN change it - at once, so FREQ and SQL LEVEL can be heard - MENU keeps
 // the change and EXIT puts the value back. EXIT from the list saves and
 // returns. Rows the screen leaves out (ALERT_SetOnScreen) are skipped.
+//
+// A row whose value is a number with a point in it - FREQ MHz "151.5125",
+// SQL LEVEL "3.5" - can also be typed with the number keys, as a frequency
+// is on the radio's main screen: each digit fills the next place, the point
+// stays where it is, and the value is set the moment the last place is
+// filled. MENU sets it sooner, the places left as zeros; EXIT takes the last
+// digit back. A digit on such a row in the list starts the change too.
 
 // The next row the screen shows from row, in dir, wrapping round.
 static uint8_t NextRow(uint8_t row, int8_t dir)
@@ -880,7 +889,10 @@ static void DrawSettings(void)
 	for (uint8_t i = 0; i < SET_ROWS && first + i < shown; i++) {
 		const uint8_t row = order[first + i];
 		const uint8_t y   = (uint8_t)(1u + i);
-		ALERT_SetValue(row, v);
+		if (row == setIndex && typedN)
+			strcpy(v, typed);           // what has been typed so far: "151.5___"
+		else
+			ALERT_SetValue(row, v);
 		// 9 + 9 = 18: the longest name ("SQL LEVEL") and the longest value
 		// ("2 COPIES", "151.5125") with a space between at the least
 		sprintf(s, "%-9s%9s", ALERT_SetName(row), v);
@@ -899,11 +911,85 @@ static bool Numeric(const char *v)
 	return true;
 }
 
+// Digits with exactly one point: a value the number keys can type.
+static bool Typable(uint8_t row)
+{
+	char    v[12];
+	uint8_t dots = 0;
+
+	ALERT_SetValue(row, v);
+	for (const char *c = v; *c; c++) {
+		if (*c == '.')
+			dots++;
+		else if (*c < '0' || *c > '9')
+			return false;
+	}
+	return dots == 1u;
+}
+
+// The typed value, the places not reached as zeros, set as the console would
+// set it: whole, checked, the frequency to the nearest 12.5 kHz channel.
+// False (and a note) when the row refuses it - FREQ outside 130-174 MHz.
+static bool TypedSet(void)
+{
+	char s[12];
+
+	for (uint8_t i = 0; i < sizeof(s); i++)
+		if ((s[i] = typed[i] == '_' ? '0' : typed[i]) == 0)
+			break;
+	typedN = 0;
+	if (ALERT_SetTo(setIndex, s) == NULL)
+		return true;
+	ALERTUI_Note("OUT OF RANGE");
+	return false;
+}
+
+// One digit into the next place. The first takes the shape of the value as
+// it is now: every digit a place, the point kept.
+static void TypeDigit(char c)
+{
+	char *p;
+
+	if (!typedN) {
+		ALERT_SetValue(setIndex, typed);
+		for (p = typed; *p; p++)
+			if (*p != '.')
+				*p = '_';
+	}
+	if ((p = strchr(typed, '_')) == NULL)
+		return;
+	*p = c;
+	typedN++;
+	if (!strchr(typed, '_'))
+		(void)TypedSet();             // every place filled: set it now
+}
+
+// EXIT while typing: the last digit typed is a place again.
+static void TypeBack(void)
+{
+	for (char *p = typed + strlen(typed); p-- > typed;) {
+		if (*p >= '0' && *p <= '9') {
+			*p = '_';
+			typedN--;
+			return;
+		}
+	}
+}
+
 static void SettingsKey(KEY_Code_t key, bool held)
 {
 	char v[12];
+	const bool digit = key <= KEY_9;
 
 	if (!editing) {
+		if (digit && Typable(setIndex)) {
+			// typing on the list starts the change with that digit
+			ALERT_SetValue(setIndex, editWas);
+			editing = true;
+			typedN  = 0;
+			TypeDigit((char)('0' + key));
+			return;
+		}
 		switch (key) {
 			case KEY_UP:   setIndex = NextRow(setIndex, -1); break;
 			case KEY_DOWN: setIndex = NextRow(setIndex, +1); break;
@@ -912,6 +998,7 @@ static void SettingsKey(KEY_Code_t key, bool held)
 					break;
 				ALERT_SetValue(setIndex, editWas);
 				editing = true;
+				typedN  = 0;
 				break;
 			case KEY_EXIT:
 				if (held)
@@ -922,6 +1009,28 @@ static void SettingsKey(KEY_Code_t key, bool held)
 			default: break;
 		}
 		return;
+	}
+
+	if (digit) {
+		if (Typable(setIndex))
+			TypeDigit((char)('0' + key));
+		return;
+	}
+	if (typedN) {
+		// part of a value typed: MENU sets it, EXIT takes a digit back,
+		// UP/DOWN forget it and step from the value as it is
+		if (key == KEY_MENU) {
+			if (TypedSet()) {
+				editing = false;
+				ALERT_SettingsChanged();
+			}
+			return;
+		}
+		if (key == KEY_EXIT) {
+			TypeBack();
+			return;
+		}
+		typedN = 0;
 	}
 
 	if (held) {
@@ -958,6 +1067,7 @@ void ALERTUI_Reset(void)
 	view        = ALERT_VIEW_MAIN;
 	setIndex    = 0;
 	editing     = false;
+	typedN      = 0;
 	srcLog      = UseLog();
 	lastDecodes = ALERT_Decodes();
 	idle        = 0;
@@ -1070,6 +1180,7 @@ void ALERTUI_Key(KEY_Code_t key, bool held)
 			view      = ALERT_VIEW_SETTINGS;
 			setIndex  = 0;
 			editing   = false;
+			typedN    = 0;
 			noteTicks = 0;            // a note from the list would cover two rows
 			break;
 		case KEY_EXIT:

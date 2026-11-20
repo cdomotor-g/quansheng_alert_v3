@@ -407,8 +407,9 @@ What they show: the four layouts (`main-big`, `main-two`, `main-classic`,
 `main-list`; LAYOUT in settings, or key 2 on the list), a reading two back
 from the newest (`big-older`), readings arriving while scrolled
 (`two-held`), the notes a key gives (`note-*`), the detail view, the
-settings list and a value being changed, and the screen before the first
-reading. The scenarios are at the bottom of `screens.py`: add one there to
+settings list and a value being changed - stepped, or typed with the number
+keys (`settings-typing`, `settings-typed`, `settings-range`) - and the
+screen before the first reading. The scenarios are at the bottom of `screens.py`: add one there to
 see a case before flashing it.
 
 ## The tools

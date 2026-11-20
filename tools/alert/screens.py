@@ -180,6 +180,15 @@ SCENARIOS = {
     'settings': main_view('two', 'key F\nkey F\nkey F\nkey MENU\ndraw settings\n'),   # F round to SQL, its note gone
     'settings-edit': main_view('two', 'key MENU\nkey MENU\nkey UP\ndraw settings-edit\n'),
     'settings-lower': main_view('two', 'key MENU\n' + 'key DOWN\n' * 7 + 'draw settings-lower\n'),
+    # the number keys: a frequency half typed, one typed in full (set as the
+    # last digit goes in), one out of range, and the squelch
+    'settings-typing': main_view('two', 'key MENU\n' + ''.join('key %s\n' % d for d in '1515') +
+                                 'draw settings-typing\n'),
+    'settings-typed': main_view('two', 'key MENU\n' + ''.join('key %s\n' % d for d in '1625125') +
+                                'draw settings-typed\n'),
+    'settings-range': main_view('two', 'key MENU\n' + ''.join('key %s\n' % d for d in '2000000') +
+                                'draw settings-range\n'),
+    'settings-squelch': main_view('two', 'key MENU\nkey DOWN\nkey 3\ndraw settings-squelch\n'),
     # nothing heard yet, and the first seconds
     'waiting': 'nf -112\nentry 2\ndraw waiting\n',
     'settling': 'nf -112\nentry 0 7\ndraw settling\n',

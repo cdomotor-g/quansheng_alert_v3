@@ -238,6 +238,17 @@ const char *ALERT_SetTo(uint8_t row, const char *value)
 			}
 		return "ARGS";
 	}
+	if (!strcmp(rowName[row], "FREQ MHz")) {
+		// as alert.c: 130-174 MHz, to the nearest 12.5 kHz channel
+		long f = (long)(atof(value) * 10000.0 + 0.5);    // in 100 Hz
+		if (f < 1300000 || f > 1740000)
+			return "RANGE";
+		f = (f + 62) / 125 * 125;
+		snprintf(rowVal[row], sizeof(rowVal[row]), "%ld.%04ld", f / 10000, f % 10000);
+		return NULL;
+	}
+	if (!strcmp(rowName[row], "SQL LEVEL") && atof(value) > 9.0)
+		return "RANGE";
 	snprintf(rowVal[row], sizeof(rowVal[row]), "%s", value);
 	return NULL;
 }

@@ -198,7 +198,14 @@ lights only its value and turns the title into `MENU=OK EXIT=UNDO`; UP/DOWN
 change it, taking effect at once (FREQ retunes, SQL LEVEL applies); MENU
 keeps the change, EXIT puts back the value it had when MENU was pressed.
 EXIT from the rows saves and returns. Held UP/DOWN repeat (while changing,
-only for numbers). The screen leaves out MDM MODE (always ADC) and, in a
+only for numbers). A row whose value is a number with a point - FREQ MHz,
+SQL LEVEL - can also be typed with 0-9, as the radio's main screen takes a
+frequency: each digit fills the next place (`151.5___`), the point stays,
+and the value is set (through ALERT_SetTo, so FREQ goes to the nearest
+12.5 kHz channel) the moment the last place is filled; MENU sets it sooner
+with the places left as zeros, EXIT takes the last digit back, and a value
+the row refuses gives the note `OUT OF RANGE`. A digit on such a row in the
+list starts the change with it. The screen leaves out MDM MODE (always ADC) and, in a
 build without voice prompts, VOICE; the console has every row.
 
 Keys on the main view: UP/DOWN scroll (UP newer, DOWN older) · MENU settings ·
