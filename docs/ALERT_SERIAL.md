@@ -418,19 +418,25 @@ shapes of `HELP`, `INFO`, `TIME`, `GET`, `STN INFO` and `SPI` are †. The
 
 | Name | Values | Default | Notes |
 |---|---|---|---|
-| `VOICE` | `OFF` `ON` | OFF | Read new readings out loud |
+| `FREQ_MHZ` | `130`-`174`, e.g. `151.5000` | as stored | Set to the nearest 12.5 kHz channel, in one retune. `GET` gives four decimals, so a 12.5 kHz channel such as `151.5125` reads in full; `SET` takes up to five. |
+| `SQL_LEVEL` | `0.0`-`9.0`, e.g. `3.0` | as stored | |
 | `SPEAKER` | `OFF` `SQL` `ON` | SQL | SQL = speaker on only while the squelch is open |
-| `CSV_OUT` | `OFF` `ON` | ON | The section 5 records. The console answers either way. |
-| `LOG` | `OFF` `ON` | ON | Append to the flash log (only when the log is usable). OFF writes nothing at all to the log region, not even the boot counter (`boot` is then empty); the console's `LOG CLEAR`/`LOG FORMAT` still do what they say. |
+| `LAYOUT` | `BIG` `TWO` `CLASSIC` `LIST` | BIG | How the readings fill the radio's screen: one big, two, three (the first layout), or six a row each. Key `2` steps through them. |
+| `VOICE` | `OFF` `ON` | OFF | Read new readings out loud. Only builds with the voice prompts can; the published build has none, and its settings screen leaves this row out. |
 | `UNKNOWN` | `SHOW` `HIDE` | SHOW | HIDE keeps addresses that are not in the table off the screen and out of the voice. DEC lines and the log still carry them. |
+| `LOG` | `OFF` `ON` | ON | Append to the flash log (only when the log is usable). OFF writes nothing at all to the log region, not even the boot counter (`boot` is then empty); the console's `LOG CLEAR`/`LOG FORMAT` still do what they say. |
+| `CSV_OUT` | `OFF` `ON` | ON | The section 5 records. The console answers either way. |
 | `CONFIRM` | `OFF` `2 COPIES` | OFF | Require the same reading twice in one burst |
 | `SQ_GATE` | `OFF` `ON` | ON | A burst must peak 15 dB over the floor to count |
 | `SNR_REQ` | `6`-`20` (whole dB) | 12 | dB over the noise floor assumed necessary to decode; used for `sens` |
-| `DEBUG` | `OFF` `ON` | OFF | Adds the `D` heartbeat and raw `A` lines |
-| `MDM_MODE` | `ADC` | ADC | Read-only |
 | `CENSUS` | the chosen audio pin, e.g. `PA4B`; `NOT RUN`, `PENDING` | | `SET CENSUS +` (or UP on the row) re-runs it; no other value sets it (`ERR,ARGS`) |
-| `FREQ_MHZ` | `130`-`174`, e.g. `151.500` | as stored | Set to the nearest 12.5 kHz channel, in one retune |
-| `SQL_LEVEL` | `0.0`-`9.0`, e.g. `3.0` | as stored | |
+| `DEBUG` | `OFF` `ON` | OFF | Adds the `D` heartbeat and raw `A` lines |
+| `MDM_MODE` | `ADC` | ADC | Read-only. The settings screen leaves it out. |
+
+`GET` and `INFO` list the rows in this order, which is the settings screen's:
+what is changed in the field first, the diagnostics last. Read them by name,
+not by position; the order changed on 2026-11-20 (it used to start with
+`VOICE` and end with `FREQ_MHZ`, `SQL_LEVEL`).
 
 A value is checked whole before anything changes: a word the row does not
 have, or a number that is not plain digits with at most one `.` (no sign, no
@@ -463,19 +469,20 @@ INFO,batt_pct,78
 INFO,nf,-121
 INFO,log,OK,1040,5969
 INFO,stn,BUILTIN MegaNet:95f6f8d,443,BUILTIN
-GET,VOICE,OFF
+GET,FREQ_MHZ,151.5000
+GET,SQL_LEVEL,3.0
 GET,SPEAKER,SQL
-GET,CSV_OUT,ON
-GET,LOG,ON
+GET,LAYOUT,BIG
+GET,VOICE,OFF
 GET,UNKNOWN,SHOW
+GET,LOG,ON
+GET,CSV_OUT,ON
 GET,CONFIRM,OFF
 GET,SQ_GATE,ON
 GET,SNR_REQ,12
+GET,CENSUS,PA4B
 GET,DEBUG,OFF
 GET,MDM_MODE,ADC
-GET,CENSUS,PA4B
-GET,FREQ_MHZ,151.500
-GET,SQL_LEVEL,3.0
 OK
 > CSV HDR
 HDR,fw,4d06107f,schema,2

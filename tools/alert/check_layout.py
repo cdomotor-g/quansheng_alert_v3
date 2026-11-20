@@ -12,16 +12,22 @@ Two faults reached hardware that a script can rule out without a reflash:
     under the bezel and cannot be read - which is where the counters were.
 
 The V2 screens (alert_ui.c) compute most rows and all of the data's widths,
-so the file is built to be checkable instead: every main-area string goes
-through Text()/TextRight(), which refuse row 6 at run time and are clipped
-to the row by UI_PrintStringSmall, and every status-line string goes through
-Status(), which clips it to the width planned for its column. What is
-enforced here, all exactly:
+so the file is built to be checkable instead: everything drawn on the main
+area goes through a handful of writers - Put() for small text (Text(),
+TextRight() and TextCentre() call it), Digits() and Digits2() for the big
+digits, Big() for big letters, Invert() and Rule() for bars and lines,
+DrawScrollBar() - each of which refuses a row that would reach row 6 at run
+time, and every status-line string goes through Status(), which clips it to
+the width planned for its column. What is enforced here, all exactly:
 
-  1. rows: no literal row >= 6 anywhere; no UI_PrintString* call with a
-     computed row outside Text(); Text() holds the `row < UI_ROWS` guard,
-     UI_ROWS is 6 and UI_COLS 18; no gFrameBuffer[6].
-  2. literals: a literal on a row fits from its column (18 characters).
+  1. rows: no literal row >= 6 anywhere; no UI_PrintString* or
+     UI_DisplayFrequency call with a computed row, and no gFrameBuffer[] with
+     a computed row, outside those writers; each writer holds its own guard
+     (Put `row < UI_ROWS`, Digits/Big `row + 1u < UI_ROWS`, Digits2
+     `row + 3u >= UI_ROWS`, ...); UI_ROWS is 6 and UI_COLS 18; no
+     gFrameBuffer[6], literal or computed from the defines.
+  2. literals: a literal on a row fits from its column (18 characters, 16
+     in the big letters).
   3. status line: the ST_<F>_X / ST_<F>_W fields do not overlap each other or
      the battery icon (its width read from bitmaps.h) and stay on the panel;
      each Status() call names one field's X and W, and a literal fits its W.
@@ -56,7 +62,20 @@ BEZEL_ROW = 6                     # unreadable on this hardware
 
 STR = r'"((?:[^"\\]|\\.)*)"'
 PRINTS = ('UI_PrintString', 'UI_PrintStringSmallNormal', 'UI_PrintStringSmallBold',
-          'UI_PrintStringSmallNormalInverse')
+          'UI_PrintStringSmallNormalInverse', 'UI_DisplayFrequency')
+BIG_CHARS = 16                    # the big letters: 8 px each
+
+# The main-area writers and the guard each must hold: the only places a
+# computed row may reach the frame buffer.
+WRITERS = {
+    'Put': r'\brow\s*<\s*UI_ROWS\b',
+    'Digits': r'\brow\s*\+\s*1u?\s*<\s*UI_ROWS\b',
+    'Big': r'\brow\s*\+\s*1u?\s*<\s*UI_ROWS\b',
+    'Digits2': r'\brow\s*\+\s*3u?\s*>=\s*UI_ROWS\b',
+    'Invert': r'\brow\s*>=\s*UI_ROWS\b',
+    'Rule': r'\brow\s*<\s*UI_ROWS\b',
+    'DrawScrollBar': r'\by\s*<\s*len\b.*BAR_PX|BAR_PX[\s\S]*\by\s*<\s*len\b',
+}
 STATUS_PRINTS = ('UI_PrintStringSmallBufferNormal', 'UI_PrintStringSmallBufferBold')
 
 
@@ -175,31 +194,40 @@ def check_screen(path, problems, sizes):
     def inside(pos, span):
         return span is not None and span[0] <= pos < span[1]
 
-    text_body = body(text, 'Text')
     status_body = body(text, 'Status')
+    writers = {f: body(text, f) for f in WRITERS}
+    writers = {f: span for f, span in writers.items() if span is not None}
 
-    # 1 + 2. the helpers' own guards, when this file has them
-    if text_body is not None:
-        if not re.search(r'\brow\s*<\s*UI_ROWS\b', text[text_body[0]:text_body[1]]):
-            fail(text_body[0], 'Text() no longer refuses rows >= UI_ROWS')
+    def in_writer(pos):
+        return any(inside(pos, span) for span in writers.values())
+
+    # 1 + 2. the writers' own guards, when this file has them
+    for f, span in writers.items():
+        if not re.search(WRITERS[f], text[span[0]:span[1]]):
+            fail(span[0], '%s() no longer holds its row guard (%s)' % (f, WRITERS[f]))
+    if writers:
+        at = min(span[0] for span in writers.values())
         if evaluate(defs.get('UI_ROWS', ''), defs, sizes) != BEZEL_ROW:
-            fail(text_body[0], 'UI_ROWS must be %d: row %d is under the bezel'
-                 % (BEZEL_ROW, BEZEL_ROW))
+            fail(at, 'UI_ROWS must be %d: row %d is under the bezel' % (BEZEL_ROW, BEZEL_ROW))
         if evaluate(defs.get('UI_COLS', ''), defs, sizes) != MAX_CHARS:
-            fail(text_body[0], 'UI_COLS must be %d' % MAX_CHARS)
+            fail(at, 'UI_COLS must be %d' % MAX_CHARS)
 
-    # the firmware's writers: row literal and clear of the bezel, or inside Text()
+    # the firmware's writers: row literal and clear of the bezel, or inside a writer
     for fn in PRINTS:
         for pos, args in calls(text, fn):
-            if len(args) < 4:
+            if len(args) < 4 or (fn == 'UI_DisplayFrequency' and len(args) != 4):
                 continue
-            s, start, row = literal(args[0]), number(args[1]), number(args[3])
+            s, start = literal(args[0]), number(args[1])
+            row = number(args[2] if fn == 'UI_DisplayFrequency' else args[3])
             if row is None:
-                if not inside(pos, text_body):
-                    fail(pos, '%s with a computed row: route it through Text(), '
-                         'which refuses row %d' % (fn, BEZEL_ROW))
-            elif row >= BEZEL_ROW:
+                if not in_writer(pos):
+                    fail(pos, '%s with a computed row: route it through Put() or another '
+                         'writer, which refuses row %d' % (fn, BEZEL_ROW))
+                continue
+            if row + (1 if fn in ('UI_PrintString', 'UI_DisplayFrequency') else 0) >= BEZEL_ROW:
                 fail(pos, 'row %d is under the bezel and cannot be read' % row)
+            if fn == 'UI_DisplayFrequency':
+                continue
             if s is not None:
                 if len(s) > MAX_CHARS:
                     fail(pos, 'literal is %d chars, %d fit: "%s"' % (len(s), MAX_CHARS, s))
@@ -216,18 +244,45 @@ def check_screen(path, problems, sizes):
         if s is not None and (col or 0) + len(s) > MAX_CHARS:
             fail(pos, '"%s" from column %d is %d chars, %d fit'
                  % (s, col or 0, len(s), MAX_CHARS - (col or 0)))
-    for pos, args in calls(text, 'TextRight'):
-        if len(args) != 2:
+    for fn in ('TextRight', 'TextCentre'):
+        for pos, args in calls(text, fn):
+            if len(args) != 2:
+                continue
+            s, row = literal(args[0]), number(args[1])
+            if row is not None and row >= BEZEL_ROW:
+                fail(pos, '%s on row %d, which is under the bezel' % (fn, row))
+            if s is not None and len(s) > MAX_CHARS:
+                fail(pos, 'literal is %d chars, %d fit: "%s"' % (len(s), MAX_CHARS, s))
+    for pos, args in calls(text, 'Put'):
+        if len(args) != 4:
             continue
-        s, row = literal(args[0]), number(args[1])
+        s, x, row = literal(args[0]), number(args[1]), number(args[2])
         if row is not None and row >= BEZEL_ROW:
-            fail(pos, 'TextRight on row %d, which is under the bezel' % row)
-        if s is not None and len(s) > MAX_CHARS:
-            fail(pos, 'literal is %d chars, %d fit: "%s"' % (len(s), MAX_CHARS, s))
+            fail(pos, 'Put on row %d, which is under the bezel' % row)
+        if s is not None and (x or 0) + len(s) * CHAR_PX > LCD_PX - 1:
+            fail(pos, '"%s" from %d px ends past the text columns' % (s, x or 0))
+    for pos, args in calls(text, 'Big'):
+        if len(args) != 3:
+            continue
+        s, x, row = literal(args[0]), number(args[1]), number(args[2])
+        if row is not None and row + 1 >= BEZEL_ROW:
+            fail(pos, 'Big on rows %d-%d: row %d is under the bezel' % (row, row + 1, BEZEL_ROW))
+        if s is not None and (x or 0) + len(s) * 8 > LCD_PX:
+            fail(pos, '"%s" in big letters from %d px is %d wide, %d fit'
+                 % (s, x or 0, len(s) * 8, LCD_PX - (x or 0)))
 
-    for m in re.finditer(r'gFrameBuffer\s*\[\s*(\d+)[uU]?\s*\]', text):
-        if int(m.group(1)) >= BEZEL_ROW:
-            fail(m.start(), 'gFrameBuffer[%s] is under the bezel' % m.group(1))
+    # the frame buffer by hand: a literal row, or a row from the defines
+    # (UI_ROWS - 1u), clear of the bezel - or a computed one inside a writer
+    for m in re.finditer(r'gFrameBuffer\s*\[([^\]]+)\]', text):
+        idx = m.group(1).strip()
+        if '(*' in text[max(0, m.start() - 12):m.start()]:
+            continue                      # a declaration or a pointer cast, not a write
+        v = evaluate(idx, defs, sizes)
+        if v is not None:
+            if v >= BEZEL_ROW:
+                fail(m.start(), 'gFrameBuffer[%s] is row %d, under the bezel' % (idx, v))
+        elif not in_writer(m.start()):
+            fail(m.start(), 'gFrameBuffer[%s] with a computed row outside the writers' % idx)
 
     # 3. the status line, planned as fields
     fields = {}

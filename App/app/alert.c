@@ -60,7 +60,8 @@
 //   b[1]  <1:0> SPEAKER (ALERT_SPK_*), <7:3> SNR REQ in dB
 //   b[2]  <1:0> 2 = the census choice below has decoded, <3:2> ADC pin
 //         (ALERTADC_SetChoice numbering), <4> PA8 needed by that pin
-//   b[3]  free
+//   b[3]  <7> LAYOUT has been saved, <1:0> LAYOUT (ALERT_LAYOUT_*). Every
+//         build before LAYOUT wrote 0 here, which reads as the default.
 //   b[4]  <7:4> CFG_MAGIC, <3:1> layout version, <0> confirm
 //
 // POLARITY is no longer a setting (V2_SPEC 5 does not list it): the decoder
@@ -95,6 +96,7 @@ static void DefaultConfig(void)
 	gAlertCfg.polarity     = ALERT_POL_ANY;
 	gAlertCfg.voice        = false;
 	gAlertCfg.speaker      = ALERT_SPK_SQL;
+	gAlertCfg.layout       = ALERT_LAYOUT_DEFAULT;
 	gAlertCfg.csv          = true;
 	gAlertCfg.log          = true;
 	gAlertCfg.show_unknown = true;
@@ -137,6 +139,8 @@ static void LoadConfig(void)
 		gAlertCfg.debug   = b[0] & (1u << 7);
 		gAlertCfg.speaker = b[1] & 3u;
 		gAlertCfg.snr_req = b[1] >> 3;
+		if ((b[3] & 0x80u) && (b[3] & 3u) < ALERT_LAYOUT_N)
+			gAlertCfg.layout = b[3] & 3u;
 	}
 	if (gAlertCfg.speaker > ALERT_SPK_ON)    gAlertCfg.speaker  = ALERT_SPK_SQL;
 	if (gAlertCfg.snr_req < ALERT_SNR_MIN || gAlertCfg.snr_req > ALERT_SNR_MAX)
@@ -160,7 +164,7 @@ static void StoreConfig(void)
 	b[1] = (uint8_t)((gAlertCfg.speaker & 3u) | ((gAlertCfg.snr_req & 31u) << 3));
 	b[2] = (uint8_t)((gAlertCfg.adc_ok ? CFG_ADC_OK : 0u) | ((gAlertCfg.adc_pin & 3u) << 2) |
 	                 (gAlertCfg.adc_pa8 << 4));
-	b[3] = 0;
+	b[3] = (uint8_t)(0x80u | (gAlertCfg.layout & 3u));
 	b[4] = (uint8_t)(CFG_MAGIC | (CFG_VERSION << 1) | (gAlertCfg.confirm ? 1u : 0u));
 }
 
@@ -1088,20 +1092,21 @@ const char *ALERT_AudName(void)
 }
 
 // ---------------------------------------------------------------------------
-// settings rows (V2_SPEC 5, in its order)
+// settings rows (V2_SPEC 5, in its order): what is changed in the field at
+// the top - the channel, the squelch, the speaker, the screen - then what is
+// kept and sent, then the decoder's tuning, the diagnostics last
 
 enum {
-	SET_VOICE, SET_SPEAKER, SET_CSV, SET_LOG, SET_UNKNOWN, SET_CONFIRM, SET_GATE,
-	SET_SNR, SET_DEBUG, SET_MODE, SET_CENSUS, SET_FREQ, SET_SQL, SET_N
+	SET_FREQ, SET_SQL, SET_SPEAKER, SET_LAYOUT, SET_VOICE, SET_UNKNOWN, SET_LOG,
+	SET_CSV, SET_CONFIRM, SET_GATE, SET_SNR, SET_CENSUS, SET_DEBUG, SET_MODE, SET_N
 };
 
 // "MDM MODE" and "SQ GATE" are grepped for by CI as proof the app is in the
-// image, so they keep their names whatever the rows now do.
+// image, so they keep their names whatever the rows now do. In enum order:
+// FREQ and SQL LEVEL were once swapped, so FREQ stepped the squelch.
 static const char *const setNames[SET_N] = {
-	"VOICE", "SPEAKER", "CSV OUT", "LOG", "UNKNOWN", "CONFIRM", "SQ GATE",
-	"SNR REQ", "DEBUG", "MDM MODE", "CENSUS",
-	// in enum order: these two were once swapped, so FREQ stepped the squelch
-	"FREQ MHz", "SQL LEVEL"
+	"FREQ MHz", "SQL LEVEL", "SPEAKER", "LAYOUT", "VOICE", "UNKNOWN", "LOG",
+	"CSV OUT", "CONFIRM", "SQ GATE", "SNR REQ", "CENSUS", "DEBUG", "MDM MODE"
 };
 
 uint8_t ALERT_SetCount(void)
@@ -1114,11 +1119,21 @@ const char *ALERT_SetName(uint8_t row)
 	return row < SET_N ? setNames[row] : "";
 }
 
+bool ALERT_SetOnScreen(uint8_t row)
+{
+#ifndef ENABLE_VOICE
+	if (row == SET_VOICE)
+		return false;                // no voice prompts in this build: it would do nothing
+#endif
+	return row < SET_N && row != SET_MODE;
+}
+
 // Values are at most eight characters (see the settings view), and a
 // two-state row reads exactly OFF/ON or its own two words, so the console can
 // match a SET against them.
 static const char *const onOff[2]    = { "OFF", "ON" };
 static const char *const spkNames[3] = { "OFF", "SQL", "ON" };   // ALERT_SPK_*
+static const char *const layoutNames[ALERT_LAYOUT_N] = { "BIG", "TWO", "CLASSIC", "LIST" };
 
 // The two-valued rows: where each keeps its value. NULL for the others.
 static bool *Flag(uint8_t row)
@@ -1155,6 +1170,7 @@ void ALERT_SetValue(uint8_t row, char *s)
 	}
 	switch (row) {
 		case SET_SPEAKER:  strcpy(s, spkNames[gAlertCfg.speaker % 3u]); break;
+		case SET_LAYOUT:   strcpy(s, layoutNames[gAlertCfg.layout % ALERT_LAYOUT_N]); break;
 		case SET_SNR:      sprintf(s, "%u", gAlertCfg.snr_req); break;
 		case SET_MODE:     strcpy(s, "ADC"); break;    // the only demodulator left
 		case SET_CENSUS:
@@ -1164,8 +1180,9 @@ void ALERT_SetValue(uint8_t row, char *s)
 			break;
 		case SET_SQL:      sprintf(s, "%u.%u", gEeprom.SQUELCH_LEVEL, gEeprom.SQUELCH_TENTHS); break;
 		case SET_FREQ: {
+			// four decimals: a 12.5 kHz channel such as 151.5125 needs them all
 			const uint32_t f = gRxVfo->pRX->Frequency;
-			sprintf(s, "%u.%03u", (unsigned)(f / 100000u), (unsigned)((f % 100000u) / 100u));
+			sprintf(s, "%u.%04u", (unsigned)(f / 100000u), (unsigned)((f % 100000u) / 10u));
 			break;
 		}
 		default: s[0] = 0; break;
@@ -1260,6 +1277,9 @@ bool ALERT_SetStep(uint8_t row, int dir)
 			gAlertCfg.speaker = (uint8_t)((gAlertCfg.speaker + 3 + dir) % 3);
 			if (running && !adcRunning && !adcDelayed)
 				AudioPath();
+			break;
+		case SET_LAYOUT:
+			gAlertCfg.layout = (uint8_t)((gAlertCfg.layout + ALERT_LAYOUT_N + dir) % ALERT_LAYOUT_N);
 			break;
 		case SET_SNR: {
 			const int v = (int)gAlertCfg.snr_req + dir;
@@ -1359,6 +1379,14 @@ const char *ALERT_SetTo(uint8_t row, const char *v)
 			// of three values, whichever it is is one step away, up or down
 			ALERT_SetStep(row, x == (gAlertCfg.speaker + 1) % 3 ? +1 : -1);
 			break;
+		case SET_LAYOUT:
+			while (x < ALERT_LAYOUT_N && !ValIs(layoutNames[x], v))
+				x++;
+			if (x == ALERT_LAYOUT_N)
+				return "ARGS";
+			gAlertCfg.layout = (uint8_t)x;
+			Changed(row);
+			break;
 		case SET_SNR:
 			if (!Fixed(v, 0, &x))
 				return "ARGS";
@@ -1437,10 +1465,19 @@ static void Replay(void)
 }
 #endif
 
+// A row stepped by a key on the list, saved, and said in a note over the
+// bottom of the screen: nothing else there shows SPEAKER or VOICE changing.
+static void QuickStep(uint8_t row)
+{
+	ALERT_SetStep(row, +1);
+	ALERT_SettingsChanged();
+	ALERTUI_NoteRow(row);
+}
+
 // V2_SPEC 3. alert.c keeps the keys that act on the receiver or the app -
-// EXIT, STAR, F, 0 - on the list and the detail view; everything else (MENU,
-// UP/DOWN, 1, and every key in the settings view) is the UI's. `held` is an
-// auto-repeat of UP/DOWN (see the loop).
+// EXIT, STAR, F, 0, 2 - on the list and the detail view; everything else
+// (MENU, UP/DOWN, 1, and every key in the settings view) is the UI's. `held`
+// is an auto-repeat of UP/DOWN (see the loop).
 static void OnKey(KEY_Code_t key, bool held)
 {
 	const uint8_t view = ALERTUI_View();
@@ -1463,16 +1500,23 @@ static void OnKey(KEY_Code_t key, bool held)
 				running = false;
 				return;
 			case KEY_STAR:
-				ALERT_SetStep(SET_VOICE, +1);
-				ALERT_SettingsChanged();
+#ifdef ENABLE_VOICE
+				QuickStep(SET_VOICE);
+#else
+				ALERTUI_Note("NO VOICE");
+#endif
 				return;
 			case KEY_F:
-				ALERT_SetStep(SET_SPEAKER, +1);
-				ALERT_SettingsChanged();
+				QuickStep(SET_SPEAKER);
 				return;
+			case KEY_2:
+				QuickStep(SET_LAYOUT);
+				break;                       // and the UI shows the list in it
 			case KEY_0:
 #ifdef ENABLE_VOICE
 				Replay();
+#else
+				ALERTUI_Note("NO VOICE");
 #endif
 				return;
 			default:

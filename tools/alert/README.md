@@ -384,10 +384,39 @@ python tools/alert/test_console.py                         # its tests, against 
 `radio.py log` records everything, now to `logs/alert-*.log`. Only one of
 these tools can hold the port at a time.
 
+## The screens, without a radio (2026-11-20)
+
+`screens.py` draws every screen of the ALERT app on a computer: it compiles
+`App/app/alert_ui.c` itself, with the firmware's font and text writers, for
+the PC (`screen_sim.c` stands in for the receiver, the log and the station
+table), feeds it made-up readings and writes PNGs in the LCD's colours to
+`screens/`. They are the radio's pixels, not a mock-up:
+`screens/radio-capture-classic.png` is a real capture taken over `SCREEN`,
+and `--check` redraws it and fails on any pixel that differs. It also fails
+if anything is drawn on row 6, under the bezel, and it runs the screen code
+with the address and undefined-behaviour checkers, so a write past a buffer
+shows up here rather than as a frozen radio.
+
+```bash
+python3 tools/alert/screens.py            # every screen into tools/alert/screens/
+python3 tools/alert/screens.py --check    # the checks only, nothing written
+python3 tools/alert/screens.py --ascii main-big
+```
+
+What they show: the four layouts (`main-big`, `main-two`, `main-classic`,
+`main-list`; LAYOUT in settings, or key 2 on the list), a reading two back
+from the newest (`big-older`), readings arriving while scrolled
+(`two-held`), the notes a key gives (`note-*`), the detail view, the
+settings list and a value being changed, and the screen before the first
+reading. The scenarios are at the bottom of `screens.py`: add one there to
+see a case before flashing it.
+
 ## The tools
 
 | | |
 |---|---|
+| `screens.py` | draws every screen with the firmware's own code (above); `screen_sim.c` is the stand-in radio it compiles against. |
+| `check_layout.py` | reads the screen code and fails on text past the glass, anything on row 6, or status fields that overlap. |
 | `capture_stats.py` | signal or noise, with a random baseline and the false-positive control. Feed it a log of the USB stream. |
 | `simdemod.py` | bit-exact model of `ALERT_AdcTick`, so a demodulator change can be measured before it is flashed. Its BER helper reports the *sense* as well as the rate, because "garbage" and "clean but inverted" need opposite fixes. |
 | `test_decode.c` | 13 host assertions on the decoder, including the inversion regression. Builds with `-Wall -Wextra -Werror`. |

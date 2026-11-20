@@ -18,7 +18,8 @@ code and say what you chose.
   lacks `workflow` scope), so those strings must remain in the image.
 - Display: 128 px status line (`gStatusLine`) + main rows 0..5 of `gFrameBuffer`
   (row 6 is under the bezel: never use it). Small font = 7 px per char,
-  18 chars per row. All text on the main screens uses the small font (one size).
+  18 chars per row. Text on the main screens uses the small font; numbers and
+  the notes may use the bigger ones §3 names (revised 2026-11-20).
 - RAM is 16 KB with ~4.8 KB free for stack before this work. New statics:
   at most ~1.5 KB in total. No malloc. Flash: must fit in 118 KB.
 
@@ -114,43 +115,96 @@ void     ALERT_SettingsChanged(void);       // persist cfg
 
 ## 3. Screens (Phase B, alert_ui.c)
 
-All small font, fixed columns. 18 chars per row.
+Revised 2026-11-20 after the owner found the three-entry list crowded and
+could not tell which end of it was the newest: the readings now come in four
+layouts (LAYOUT, §5), the default showing one reading big, and the settings
+work like the radio's own menu. `tools/alert/screens.py` draws every screen
+below on a computer with alert_ui.c itself; `tools/alert/screens/` holds the
+pictures.
+
+Small font = 7 px a character, 18 to a row; numbers may also use the radio's
+frequency digits (13 px wide, 16 tall: two rows) or the same at twice the
+size (24 px, 32 tall: four rows), and the notes the big letters (8 px, 16
+tall). Nothing is ever drawn on row 6. The selected reading - the one the
+detail view opens and KEY_0 says - is always the first one shown, and in
+every layout but CLASSIC its name is in a dark bar (light bold letters).
 
 **Header (status line)**: `ALERT` · RX marker (`RX` while squelch open, blank
 otherwise) · averaged noise floor `NF-112` · log indicator (`L` when logging,
 nothing otherwise) · battery icon at the right edge (reuse `UI_DrawBattery` into
 `gStatusLine`, same bitmap as the main screen uses, 13 px). Nothing overlaps.
 
-**Main list (default view)**: three entries, two rows each, newest at the top.
+**Main view, LAYOUT = BIG (default)**: the selected reading alone.
+
+```
+row 0:    ▓STRATHPINE GYMPIE▓   name in the bar (marquee if longer than 18)
+rows 1-4:       18  LEVEL       value in the double-size digits, its kind as
+                                its unit on the baseline (spelt out when it
+                                fits, else RAIN/LVL/BATT/REP), centred
+row 5:    34s AGO      NEWEST   age; NEWEST at the top, else "N NEWER"
+```
+
+**LAYOUT = TWO**: two readings, three rows each, a 1 px line between them.
+
+```
+row a:    ▓STRATHPINE GYMPIE▓   name (bold; the selected one in the bar)
+rows b-c:   18  LEVEL           value in the frequency digits, right-aligned
+                34s AGO         in a four-digit field; kind and age beside it
+```
+
+**LAYOUT = CLASSIC**: the first layout, three entries, two rows each, newest at the top.
 
 ```
 row a:  BEACHMERE ST    4m        name left (13 max, or marquee if longer), age right
 row b:  4133 LVL 22    -13        id, kind label (RAIN/LVL/BATT/REP/-), value, rssi right
 ```
 
-- Age: `12s`, `4m`, `3h`, `2d` (from uptime; epoch not needed).
-- Unknown station: row a shows `ID 4142 ?` unless UNKNOWN=HIDE (then skipped).
+**LAYOUT = LIST**: six readings, one row each: name (9), value, age; the
+selected row in the bar.
+
+In every layout:
+
+- Age: `12s`, `4m`, `3h`, `2d` (from uptime; epoch not needed), with ` AGO`
+  where there is room.
+- Unknown station: the name shows as `ID 4142 ?` (BIG: `ID 4142 (UNKNOWN)`,
+  and no kind) unless UNKNOWN=HIDE (then skipped).
 - UP/DOWN scroll one entry; a 1-px scroll bar on the rightmost column of rows
   0..5 shows position within history. History comes from the log when it is
   usable (thousands back), else from the RAM ring (16).
 - When scrolled away from the top and a new decode arrives, keep the position
   and show `+N` in place of the RX marker; EXIT or 30 s idle snaps back to top.
-- Empty history: row 0 frequency, row 1 `WAITING`, row 2 `NF -112 dBm`,
-  row 3 `BURSTS 0  DEC 0`, row 4 audio route (`AUD PA4B OK`), row 5 log state.
+- Empty history: rows 0-1 the frequency in the frequency digits with `MHz`
+  (four decimals: 12.5 kHz channels need them), row 2 `LISTENING` (bold;
+  `SETTLING 7` or `CENSUS` while starting), row 3 `SQL 3.0` and `LOG ON` /
+  `LOG OFF` / `NO LOG`, row 4 `BURSTS 0  DEC 0`, row 5 audio route
+  (`AUD PA4B OK`).
 
-**Detail view** (KEY_1 or MENU-long… use KEY_1; EXIT back): the selected entry:
-full name (marquee if > 18), `ID 4133 LEVEL`, `VAL 22 RAW 0x016`,
+**Notes**: a key that changes something on the main or detail view says what
+it did for 1.5 s, in big light letters in a dark bar over rows 4-5:
+`SPEAKER: SQL`, `LAYOUT: TWO`, `VOICE: ON`, or `NO VOICE` in a build without
+the voice prompts.
+
+**Detail view** (KEY_1; EXIT back): the selected entry:
+full name in the bar (marquee if > 18), `ID 4133 LEVEL`, `VAL 22 RAW 0x016`,
 `RSSI -13 NF -112`, `FADE +87dB` (see §4), `ABF STD INV 12s AGO`.
 
 **Marquee**: a name longer than its field scrolls one character every 300 ms
 with a 1 s pause at each end; only the top/selected entry scrolls.
 
-**Settings** (MENU): as today's view, rows re-listed in §5. UP/DOWN change the
-value, MENU/STAR move the cursor, EXIT saves and returns.
+**Settings** (MENU): the title `ALERT SETTINGS`, then five rows of
+`NAME      VALUE`, in §5's order. As the radio's own menu: UP/DOWN move the
+bar from row to row (wrapping round); MENU starts changing the row, which
+lights only its value and turns the title into `MENU=OK EXIT=UNDO`; UP/DOWN
+change it, taking effect at once (FREQ retunes, SQL LEVEL applies); MENU
+keeps the change, EXIT puts back the value it had when MENU was pressed.
+EXIT from the rows saves and returns. Held UP/DOWN repeat (while changing,
+only for numbers). The screen leaves out MDM MODE (always ADC) and, in a
+build without voice prompts, VOICE; the console has every row.
 
-Keys on the main view: UP/DOWN scroll · MENU settings · 1 detail · STAR voice
-toggle · F cycles SPEAKER · 0 replays the selected entry by voice (as today) ·
-EXIT leaves the app. Squelch level moves to settings only.
+Keys on the main view: UP/DOWN scroll (UP newer, DOWN older) · MENU settings ·
+1 detail · 2 next LAYOUT · STAR voice toggle · F cycles SPEAKER · 0 replays
+the selected entry by voice (as today) · EXIT back to the newest, then
+leaves the app. Squelch level moves to settings only.
 
 ## 4. Measurements (alert.c)
 
@@ -167,21 +221,26 @@ EXIT leaves the app. Squelch level moves to settings only.
 
 ## 5. Settings (persisted in gEeprom.ALERT_CFG[5]; bytes 1 and 3 are free now)
 
+In this order on the screen and in the console's GET (revised 2026-11-20:
+what is changed in the field first, the diagnostics last; it used to start
+with VOICE and end with FREQ MHz, SQL LEVEL).
+
 | Row name | Values | Default |
 |---|---|---|
-| VOICE | OFF/ON | OFF |
+| FREQ MHz | 12.5 kHz steps, four decimals (`151.5125`) | as today |
+| SQL LEVEL | as today | as today |
 | SPEAKER | OFF / SQL / ON | **SQL** — speaker path on only while the squelch is open |
-| CSV OUT | OFF/ON | **ON** |
-| LOG | OFF/ON | **ON** (only effective if the region is usable) |
+| LAYOUT | BIG / TWO / CLASSIC / LIST (§3), in ALERT_CFG[3] | **BIG** |
+| VOICE | OFF/ON (on the screen only in builds with voice prompts) | OFF |
 | UNKNOWN | SHOW/HIDE | SHOW |
+| LOG | OFF/ON | **ON** (only effective if the region is usable) |
+| CSV OUT | OFF/ON | **ON** |
 | CONFIRM | OFF / 2 COPIES | OFF |
 | SQ GATE | OFF/ON | ON (keep the name) |
 | SNR REQ | 6..20 dB | 12 |
-| DEBUG | OFF/ON | OFF (D heartbeat and raw A lines) |
-| MDM MODE | ADC (read-only; keep the name) | ADC |
 | CENSUS | shows result; UP re-runs | — |
-| FREQ MHz | 12.5 kHz steps | as today |
-| SQL LEVEL | as today | as today |
+| DEBUG | OFF/ON | OFF (D heartbeat and raw A lines) |
+| MDM MODE | ADC (read-only; keep the name; console only) | ADC |
 
 SPEAKER=SQL: `AUDIO_AudioPathOn()` on squelch open, `Off()` on close, unless
 the census choice needs PA8 (then the ADC module owns PA8 during the burst, as

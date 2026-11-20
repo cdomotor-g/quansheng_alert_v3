@@ -7,7 +7,7 @@
   "tagline": "ALERT flood-telemetry receiver firmware for the Quansheng UV-K5 V3 and UV-K1, a fork of F4HWN.",
   "about": "A fork of the F4HWN firmware for the PY32F071 radios that adds an ALERT receiver app: it demodulates the 300-baud bursts on 151.5 MHz in software, decodes them, names the station from a table generated from Flood-Net's station list, logs to SPI flash and talks to a computer over USB-C. Our work is the app (App/app/alert_*), its host tools (tools/alert/, tools/hotflash.py), filters/ and docs/ALERT_SERIAL.md; everything else is upstream F4HWN. People get it through the quansheng_alert_ALL installer, and Flood-Net and RPi ALERT read it over serial.",
   "kind": "radio firmware (F4HWN fork)",
-  "logo": "tools/alert/screens/v2-list.png",
+  "logo": "tools/alert/screens/main-big.png",
   "site": "https://cdomotor-g.github.io/quansheng_alert_ALL/",
   "docs": {
     "readme": "README.md",
@@ -18,9 +18,10 @@
   },
   "status": {
     "phase": "beta",
-    "updated": "2026-10-31",
-    "summary": "Receiver v2 decodes on air (22 of 22 bursts) and ships through quansheng_alert_ALL; no firmware work since 1 October, and its built-in station table is a month behind Flood-Net.",
+    "updated": "2026-11-20",
+    "summary": "Receiver v2 decodes on air (22 of 22 bursts) and ships through quansheng_alert_ALL. A usability pass (2026-11-20) gave the screen four layouts, one big reading by default, a clear NEWEST / N NEWER marker, notes that confirm a key, and settings in the radio's own menu style with frequency and squelch first; it is drawn and checked on a computer but not yet tried on the radio.",
     "next": [
+      "Try the new layouts on the radio and keep or drop each from the owner's feedback (key 2 cycles them)",
       "Regenerate the built-in station table: Flood-Net now gives 451 sites, not 443",
       "Record which Flood-Net commit the built-in table was generated from",
       "Drop A2C's zero status-byte check; Flood-Net reads it as a time offset (cdomotor-g/MegaNet#209)",
@@ -98,7 +99,7 @@
     {
       "id": "host-tools",
       "name": "Host tools",
-      "what": "alertterm.py (the reference client), hotflash.py for flashing over USB-C, and the capture, simulation and layout checks.",
+      "what": "alertterm.py (the reference client), hotflash.py for flashing over USB-C, screens.py (every screen drawn on a computer by the firmware's own code), and the capture, simulation and layout checks.",
       "paths": [
         "tools/alert/",
         "tools/hotflash.py"
@@ -186,7 +187,7 @@
     {
       "id": "screens",
       "name": "Screen captures",
-      "what": "PNG captures of the v2 screens taken from the radio over SCREEN; the setup guide shows copies.",
+      "what": "Pictures of every screen of the ALERT app, drawn by tools/alert/screens.py with the firmware's own screen code, plus one real capture taken over SCREEN that they are checked against; the setup guide shows copies.",
       "component": "alert-app",
       "paths": [
         "tools/alert/screens/"

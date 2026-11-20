@@ -60,9 +60,21 @@ enum {
 	ALERT_SPK_ON,           // always on (listen to the channel)
 };
 
+// LAYOUT: how the readings fill the screen, in the order KEY_2 steps through
+// them - fewest and biggest first.
+enum {
+	ALERT_LAYOUT_BIG = 0,   // one reading, its value in digits twice the frequency's size
+	ALERT_LAYOUT_TWO,       // two readings, values in the frequency digits
+	ALERT_LAYOUT_CLASSIC,   // three readings, two rows each: the first layout
+	ALERT_LAYOUT_LIST,      // six readings, one row each
+	ALERT_LAYOUT_N
+};
+#define ALERT_LAYOUT_DEFAULT ALERT_LAYOUT_BIG
+
 typedef struct {
 	bool    voice;          // VOICE: read new readings out loud
 	uint8_t speaker;        // SPEAKER: ALERT_SPK_*
+	uint8_t layout;         // LAYOUT: ALERT_LAYOUT_*
 	bool    csv;            // CSV OUT: CSV lines on USB / UART
 	bool    log;            // LOG: append to the SPI-flash log when it is usable
 	bool    show_unknown;   // UNKNOWN: show addresses not in the station table
@@ -111,8 +123,9 @@ uint8_t  ALERT_AdcState(void);
 bool     ALERT_CensusPending(void);      // requested, or running now
 const char *ALERT_AudName(void);         // census pin: "NONE", "PA4", "PA4B", "PB1"
 
-// Settings rows, shared by the settings view and the console. Names are at
-// most 9 characters, values at most 8 (the settings row is 1 + 9 + 8 = 18).
+// Settings rows, shared by the settings view and the console, in the order
+// both list them: the ones changed in the field first, the diagnostics last.
+// Names are at most 9 characters, values at most 8 (the settings row is 9 + 9).
 //
 // ALERT_SetStep: +1 UP, -1 DOWN. While APP_RunAlert runs it takes effect at
 // once, receiver included. Outside the app (the console from app.c's slice)
@@ -125,6 +138,10 @@ uint8_t     ALERT_SetCount(void);
 const char *ALERT_SetName(uint8_t row);
 void        ALERT_SetValue(uint8_t row, char *out);   // out: >= 9 bytes
 bool        ALERT_SetStep(uint8_t row, int dir);      // false: not changed (see above)
+// Whether the settings screen lists the row. The console has every row; the
+// screen leaves out MDM MODE (it only ever reads ADC) and VOICE in a build
+// without the voice prompts, where it would do nothing.
+bool        ALERT_SetOnScreen(uint8_t row);
 // SET <name> <value> (the console): the row straight to that value, spelt as
 // ALERT_SetValue gives it ('_' for a space, either case), numbers in the
 // row's own units - FREQ MHz goes to the nearest 12.5 kHz channel. Nothing
@@ -166,6 +183,11 @@ void    ALERTUI_DrawStatus(void);                // status line only (every 100 
 void    ALERTUI_MarkRx(void);
 uint8_t ALERTUI_View(void);                      // ALERT_VIEW_*
 void    ALERTUI_Reset(void);                     // app entry: main view, top of the list
+// What a key just did ("SPEAKER: ON"), for 1.5 s in big letters in a bar
+// over the bottom two rows: at most 16 characters. ALERTUI_NoteRow says a
+// settings row and its value so.
+void    ALERTUI_Note(const char *s);
+void    ALERTUI_NoteRow(uint8_t row);
 // The entry the list (or the detail view) is on, as entries back from the
 // newest in the list's own source (the log when usable, else ALERT_History):
 // 0 = the top. alert.c keeps EXIT and KEY_0 on the list, and asks this so that
