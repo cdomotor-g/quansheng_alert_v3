@@ -47,7 +47,7 @@ LCD_FG = (0x28, 0x28, 0x28)
 # Values the settings rows show in the pictures. The rows themselves, and
 # their order, are read from alert.c.
 ROW_VALUES = {
-    'FREQ MHz': '151.500', 'SQL LEVEL': '3.0', 'SPEAKER': 'SQL', 'LAYOUT': 'BIG',
+    'FREQ MHz': '151.5000', 'SQL LEVEL': '3.0', 'SPEAKER': 'SQL', 'LAYOUT': 'BIG',
     'VOICE': 'OFF', 'UNKNOWN': 'SHOW', 'LOG': 'ON', 'CSV OUT': 'ON', 'CONFIRM': 'OFF',
     'SQ GATE': 'ON', 'SNR REQ': '12', 'CENSUS': 'PA4B', 'DEBUG': 'OFF', 'MDM MODE': 'ADC',
 }
