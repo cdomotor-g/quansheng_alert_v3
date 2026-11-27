@@ -643,10 +643,29 @@ static void DrawEmpty(void)
 // the detail view opens and KEY_0 says again - is always the first, and in
 // every layout but CLASSIC its name is in a dark bar.
 
+// The signal-to-noise ratio of a reading as BIG shows it, three characters at
+// most: the burst's peak over the noise floor at the time, in dB. A record
+// with no floor (0 dBm or above is no real floor) shows "--".
+static void FormatSnr(char *out, const AlertRecord_t *r)
+{
+	int snr = r->rssi - r->nf;
+	if (r->nf >= 0) {
+		strcpy(out, "--");
+		return;
+	}
+	if (snr > 99)
+		snr = 99;
+	if (snr < -99)
+		snr = -99;
+	sprintf(out, "%+d", snr);
+}
+
 // BIG: the selected reading alone.
 //   ▓STRATHPINE GYMPIE▓   the name in the bar (the marquee's when longer)
-//      18  LEVEL          the value in digits twice the frequency's size,
-//                         and its kind as its unit; rows 1-4
+//            SNR          the value in digits twice the frequency's size,
+//      18    +33          rows 1-4; beside it, in one column, the SNR
+//             dB          (rows 1-3) and the kind as its unit (row 4)
+//          LEVEL
 //   34s AGO     NEWEST    how old, and where in the history
 static bool DrawBig(void)
 {
@@ -662,21 +681,32 @@ static bool DrawBig(void)
 	Invert(0, 0, BAR_END);
 
 	FormatValue(v, r.value, n->kind, false);
-	if (r.value == ALERT_VALUE_FULL_SCALE) {
-		Big("FULL", (TEXT_PX - 4u * 8u) / 2u, 2);   // 2047: the sensor's maximum, centred
-	} else {
-		// value, a gap, then the kind - spelt out when it fits beside the
-		// number - the whole centred, the kind on the digits' baseline. An
-		// address the table does not have has no kind: the value alone.
-		const uint8_t vw = (uint8_t)(DigitsWidth(v, DIGIT2_PX, DOT2_PX) - 4u);
-		const char   *k  = n->known ? kindLong[n->kind & 7u] : "";
-		uint8_t       w;
+	{
+		// value, a gap, then one column: SNR, its figure and dB on rows 1-3,
+		// the kind - spelt out when it fits - on the digits' baseline, row 4.
+		// The whole is centred. An address the table does not have has no
+		// kind; FULL (2047, the sensor's maximum) is in big letters, rows 2-3.
+		// The column is at least "SNR" wide, so even "1187" plus the short
+		// kind fits: 92 + 5 + 21 = 118 of 126.
+		const bool    full = r.value == ALERT_VALUE_FULL_SCALE;
+		const uint8_t vw   = full ? 4u * 8u : (uint8_t)(DigitsWidth(v, DIGIT2_PX, DOT2_PX) - 4u);
+		const char   *k    = n->known ? kindLong[n->kind & 7u] : "";
+		char          snr[4];
+		uint8_t       cw, w, x;
 		if (vw + 5u + strlen(k) * CHAR_PX > TEXT_PX)
 			k = kindShort[n->kind & 7u];
-		w = (uint8_t)(*k ? vw + 5u + strlen(k) * CHAR_PX : vw);
-		w = (uint8_t)((TEXT_PX - w) / 2u);   // now the left edge
-		Digits2(v, w, 1);
-		Put(k, (uint8_t)(w + vw + 4u), 4, false);
+		cw = (uint8_t)((strlen(k) > 3u ? strlen(k) : 3u) * CHAR_PX);
+		w  = (uint8_t)((TEXT_PX - (vw + 5u + cw)) / 2u);   // the left edge
+		x  = (uint8_t)(w + vw + 4u);                       // the column's
+		if (full)
+			Big("FULL", w, 2);
+		else
+			Digits2(v, w, 1);
+		FormatSnr(snr, &r);
+		Put("SNR", x, 1, false);
+		Put(snr, x, 2, false);
+		Put("dB", x, 3, false);
+		Put(k, x, 4, false);
 	}
 
 	AgeAgo(s, &r, 9);

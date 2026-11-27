@@ -138,9 +138,12 @@ nothing otherwise) · battery icon at the right edge (reuse `UI_DrawBattery` int
 
 ```
 row 0:    ▓STRATHPINE GYMPIE▓   name in the bar (marquee if longer than 18)
-rows 1-4:       18  LEVEL       value in the double-size digits, its kind as
-                                its unit on the baseline (spelt out when it
-                                fits, else RAIN/LVL/BATT/REP), centred
+rows 1-4:           SNR         value in the double-size digits; beside it one
+                18  +33         column: SNR, the burst's peak over the noise
+                     dB         floor at the time (RSSI - NF, "--" if none),
+                    LEVEL       on rows 1-3, and the kind as the unit on the
+                                baseline (spelt out when it fits, else
+                                RAIN/LVL/BATT/REP); the whole centred
 row 5:    34s AGO      NEWEST   age; NEWEST at the top, else "N NEWER"
 ```
 

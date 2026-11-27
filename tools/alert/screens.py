@@ -166,11 +166,12 @@ SCENARIOS = {
     'big-older': main_view('big', 'key DOWN\nkey DOWN\ndraw big-older\n'),
     # scrolled, and two readings arrive meanwhile: +2 in the header
     'two-held': main_view('two', 'key DOWN\nrec 1994 23 -79 0\nrec 4126 35 -14 0\ndraw two-held\n'),
-    # other kinds of value in the big layout
-    'big-battery': main_view('big', 'rec 2001 136 -61 3\ndraw big-battery\n'),
-    'big-4digit': main_view('big', 'rec 1903 1187 -88 5\ndraw big-4digit\n'),
-    'big-full': main_view('big', 'rec 1903 2047 -88 5\ndraw big-full\n'),
-    'big-unknown': main_view('big', 'rec 4142 517 -95 8\ndraw big-unknown\n'),
+    # other kinds of value in the big layout, each heard over a quieter
+    # floor (-112 dBm) so its SNR is a believable one
+    'big-battery': main_view('big', 'rec 2001 136 -61 3 -112\ndraw big-battery\n'),
+    'big-4digit': main_view('big', 'rec 1903 1187 -88 5 -112\ndraw big-4digit\n'),
+    'big-full': main_view('big', 'rec 1903 2047 -88 5 -112\ndraw big-full\n'),
+    'big-unknown': main_view('big', 'rec 4142 517 -95 8 -112\ndraw big-unknown\n'),
     # the notes that confirm a key
     'note-layout': main_view('big', 'key 2\ndraw note-layout\n'),
     'note-speaker': main_view('two', 'key F\nkey F\ndraw note-speaker\n'),
